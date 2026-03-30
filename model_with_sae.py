@@ -60,6 +60,7 @@ def load_model(model_name: str, device: str, use_hooked_transformer: bool):
                     model_name=model_name,
                     device=str(device),
                     dtype=torch.bfloat16 if device == 'cuda' else torch.float32,
+                    local_files_only=True,
                 ).to(device)
 
                 return model
@@ -72,6 +73,7 @@ def load_model(model_name: str, device: str, use_hooked_transformer: bool):
             model_name,
             dtype=torch.bfloat16 if device == "cuda" else torch.float32,
             low_cpu_mem_usage=True,
+            local_files_only=True,
         )
 
         model = model.to(device).eval()
@@ -89,7 +91,10 @@ def load_tokenizer(model_name: str):
     import os
     token = os.environ.get("HF_TOKEN")
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)#, token=token)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            local_files_only=True,
+        )  # , token=token)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         return tokenizer
@@ -120,6 +125,7 @@ def load_sae(sae_path: str, device: str) -> Dict[str, Any]:
                 release=release,
                 sae_id=sae_id,
                 device=str(device),
+                local_files_only=True,
             )  # type: ignore
             sae_obj = loaded[0] if isinstance(loaded, (tuple, list)) else loaded
             print(f"SAE loaded on {device}")

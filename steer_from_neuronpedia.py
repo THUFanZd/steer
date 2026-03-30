@@ -31,6 +31,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-name", type=str, default="google/gemma-2-2b", help="HF model name/path.")
     parser.add_argument("--width", type=str, default="16k")
     parser.add_argument("--sae-release", type=str, default="gemma-scope-2b-pt-res")
+    parser.add_argument(
+        "--sae-path",
+        type=str,
+        default=None,
+        help="Optional local SAE checkpoint path (directory or file). If provided, this takes priority over --sae-release/--width canonical mapping.",
+    )
     parser.add_argument("--canonical-map-path", type=str, default=str(DEFAULT_CANONICAL_MAP_PATH))
     parser.add_argument("--device", type=str, default="cpu")     
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -509,13 +515,17 @@ def run_neuronpedia_steer(
         n=max(1, int(args.top_k_examples)),
     )
 
-    sae_uri, resolved_average_l0 = build_default_sae_path(
-        layer_id=str(args.layer_id),
-        width=str(args.width),
-        release=str(args.sae_release),
-        average_l0=None,
-        canonical_map_path=Path(args.canonical_map_path),
-    )
+    if args.sae_path:
+        sae_uri = str(args.sae_path)
+        resolved_average_l0 = "from_sae_path"
+    else:
+        sae_uri, resolved_average_l0 = build_default_sae_path(
+            layer_id=str(args.layer_id),
+            width=str(args.width),
+            release=str(args.sae_release),
+            average_l0=None,
+            canonical_map_path=Path(args.canonical_map_path),
+        )
 
     module = ModelWithSAEModule(
         llm_name=str(args.llm_name),

@@ -32,8 +32,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=str, default="16k")
     parser.add_argument("--sae-release", type=str, default="gemma-scope-2b-pt-res")
     parser.add_argument("--canonical-map-path", type=str, default=str(DEFAULT_CANONICAL_MAP_PATH))
-    parser.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
-    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--device", type=str, default="cpu")  # 或者添加显存检查逻辑    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-new-tokens", type=int, default=80)
     parser.add_argument(
         "--intervention-scope",

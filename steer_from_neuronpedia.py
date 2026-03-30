@@ -54,6 +54,16 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--top-k-examples", type=int, default=3)
     parser.add_argument("--max-prefix-tokens", type=int, default=20)
+    parser.add_argument(
+        "--strength-scales",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "List of steering scales. Supports space-separated values and/or comma-separated values, "
+            "including fractions like 2/3. Example: --strength-scales 0 2/3 1.5"
+        ),
+    )
     parser.add_argument("--neuronpedia-api-key", type=str, default=None)
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--output-root", type=str, default="outputs")
@@ -109,6 +119,42 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _parse_single_scale(text: str) -> float:
+    raw = str(text).strip()
+    if not raw:
+        raise ValueError("Empty scale value.")
+    if "/" in raw:
+        parts = raw.split("/")
+        if len(parts) != 2:
+            raise ValueError(f"Invalid fractional scale: {raw!r}")
+        num = float(parts[0].strip())
+        den = float(parts[1].strip())
+        if abs(den) <= EPS:
+            raise ValueError(f"Scale denominator cannot be zero: {raw!r}")
+        return float(num / den)
+    return float(raw)
+
+
+def _resolve_strength_scales(raw_scales: Optional[Sequence[str]]) -> List[float]:
+    if not raw_scales:
+        return [0.0, 2.0 / 3.0, 1.5]
+
+    parsed: List[float] = []
+    for item in raw_scales:
+        text = str(item).strip()
+        if not text:
+            continue
+        for piece in text.split(","):
+            token = piece.strip()
+            if not token:
+                continue
+            parsed.append(_parse_single_scale(token))
+
+    if not parsed:
+        raise ValueError("No valid strength scales provided.")
+    return parsed
 
 
 def _safe_max_token(activation: Dict[str, Any]) -> str:
@@ -482,7 +528,7 @@ def run_neuronpedia_steer(
         sae=sae,
     )
 
-    scales = [0.0, 2.0 / 3.0, 1.5]
+    scales = _resolve_strength_scales(args.strength_scales)
     sample_results: List[Dict[str, Any]] = []
     for rank, activation in enumerate(selected, start=1):
         trunc_info = _truncate_prompt_from_activation(

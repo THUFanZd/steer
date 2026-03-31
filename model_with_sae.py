@@ -60,7 +60,7 @@ def load_model(model_name: str, device: str, use_hooked_transformer: bool):
                     model_name=model_name,
                     device=str(device),
                     dtype=torch.bfloat16 if device == 'cuda' else torch.float32,
-                ).to(device)
+                ).to(device).eval()
 
                 return model
 

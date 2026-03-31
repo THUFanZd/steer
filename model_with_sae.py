@@ -360,7 +360,7 @@ class ModelWithSAEModule:
                     if self.layer >= len(hidden_states):
                         raise ValueError(f"Layer {self.layer} not available.")
 
-                    layer_activations = hidden_states[self.layer]
+                    layer_activations = hidden_states[self.layer + 1]
 
             # Process each sample in the batch
             if not self.sae:
@@ -613,7 +613,7 @@ class ModelWithSAEModule:
             raise RuntimeError("Could not locate embedding module for layer 0 intervention.")
 
         blocks = self._get_transformer_blocks()
-        block_index = self.layer - 1
+        block_index = self.layer  # - 1
         if block_index < 0 or block_index >= len(blocks):
             if 0 <= self.layer < len(blocks):
                 block_index = self.layer

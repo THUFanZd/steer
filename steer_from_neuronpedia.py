@@ -5,6 +5,7 @@ import json
 import os
 import re
 import time
+from tqdm import tqdm
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -540,7 +541,7 @@ def run_neuronpedia_steer(
 
     scales = _resolve_strength_scales(args.strength_scales)
     sample_results: List[Dict[str, Any]] = []
-    for rank, activation in enumerate(selected, start=1):
+    for rank, activation in tqdm(enumerate(selected, start=1), desc="Selected samples"):
         trunc_info = _truncate_prompt_from_activation(
             activation,
             max_prefix_tokens=max(0, int(args.max_prefix_tokens)),
@@ -575,7 +576,7 @@ def run_neuronpedia_steer(
         )
 
         interventions: List[Dict[str, Any]] = []
-        for scale in scales:
+        for scale in tqdm(scales, desc="Strength scales"):
             steer_value = float(base_activation * scale)
             steered_output = _generate_text(
                 module,

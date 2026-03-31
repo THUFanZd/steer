@@ -762,6 +762,29 @@ class ModelWithSAEModule:
                 target.add_(scalar)
         return steered
 
+    def _build_residual_sae_intervention_hook(
+        self,
+        *,
+        feature_index: int,
+        value: Union[float, torch.Tensor],
+        mode: str,
+        intervention_scope: str,
+    ):
+        def _hook_fn(clean_act, hook):
+            clean_features = self._encode_with_sae(clean_act)
+            clean_recon = self._decode_with_sae(clean_features)
+            steered_features = self._apply_feature_intervention(
+                clean_features,
+                feature_index,
+                value,
+                mode,
+                intervention_scope=intervention_scope,
+            )
+            steered_recon = self._decode_with_sae(steered_features)
+            return steered_recon + (clean_act - clean_recon)
+
+        return _hook_fn
+
     @torch.no_grad()
     def run_logits(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self.model is None:
@@ -811,25 +834,19 @@ class ModelWithSAEModule:
         if self.use_hooked_transformer:
             if "__sae_lens_obj__" not in self.sae:
                 raise RuntimeError("SAE object is required for hooked-model intervention.")
-            if self.act_hook_name is None:
-                raise RuntimeError("act_hook_name not available for hooked-model intervention.")
+            if self.hook_name is None:
+                raise RuntimeError("hook_name not available for hooked-model intervention.")
 
-            sae_obj = self.sae["__sae_lens_obj__"]
-
-            def _hook_fn(act, hook):  # noqa: ARG001
-                target = act[:, :, feature_index]
-                if intervention_scope == "last_token_only":
-                    target = target[:, -1:]
-                if mode == "clamp":
-                    target[...] = value
-                else:
-                    target[...] = target + value
-                return act
-
-            return self.model.run_with_hooks_with_saes(
+            hook_fn = self._build_residual_sae_intervention_hook(
+                feature_index=feature_index,
+                value=value,
+                mode=mode,
+                intervention_scope=intervention_scope,
+            )
+            return self.model.run_with_hooks(
                 input_ids,
-                saes=[sae_obj],
-                fwd_hooks=[(self.act_hook_name, _hook_fn)],
+                return_type="logits",
+                fwd_hooks=[(self.hook_name, hook_fn)],
             )
 
         target_module = self._resolve_local_intervention_module()
@@ -1001,11 +1018,16 @@ class ModelWithSAEModule:
         feature_index: int,
         sae_obj: SAELensSAE,
     ) -> float:
-        clean_logits = self.model.run_with_saes(tokens, saes=[sae_obj])
-        hooked_logits = self.model.run_with_hooks_with_saes(
-            tokens,
-            saes=[sae_obj],
-            fwd_hooks=[(self.act_hook_name, functools.partial(self.set_feature_act_kl_hook, feature=feature_index, value=value))],
+        _ = sae_obj
+        attention_mask = (tokens != 0).long()
+        clean_logits = self.run_logits(tokens, attention_mask=attention_mask)
+        hooked_logits = self.run_logits_with_feature_intervention(
+            input_ids=tokens,
+            feature_index=feature_index,
+            value=float(value),
+            mode="clamp",
+            attention_mask=attention_mask,
+            intervention_scope="all_tokens",
         )
         hooked_probs = hooked_logits.softmax(dim=-1)
         clean_probs = clean_logits.softmax(dim=-1)

@@ -20,6 +20,7 @@ SCOPES = {
     "all_original_tokens",
     "last_original_token_only",
 }
+SENTENCEPIECE_SPACE = chr(9601)  # '▁'
 
 
 def _parse_pair_text(text: str) -> Tuple[int, int]:
@@ -145,6 +146,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=str, default="16k")
     parser.add_argument("--neuronpedia-api-key", type=str, default=None)
     parser.add_argument("--timeout", type=int, default=30)
+    parser.add_argument(
+        "--count-token-source",
+        type=str,
+        choices=("generated", "activation"),
+        default="generated",
+        help=(
+            "generated: count using first token in steered_output.completion_text; "
+            "activation: count using token after maxValueTokenIndex in Neuronpedia activation."
+        ),
+    )
     parser.add_argument("--save-json", type=str, default=None)
     return parser.parse_args()
 
@@ -257,6 +268,39 @@ def _build_token_set(payload: Dict[str, Any]) -> Set[str]:
     return tokens
 
 
+def _extract_first_generated_piece(completion_text: str) -> str:
+    text = str(completion_text or "").lstrip()
+    if not text:
+        return ""
+    match = re.match(r"\S+", text)
+    if not match:
+        return ""
+    return match.group(0)
+
+
+def _candidate_generated_tokens(piece: str, token_set: Set[str]) -> Set[str]:
+    if not piece:
+        return set()
+
+    trimmed = piece.strip()
+    stripped = trimmed.strip(".,;:!?()[]{}\"'`")
+    base_variants = {piece, trimmed, stripped}
+    base_variants = {x for x in base_variants if x}
+
+    prefix_chars = {SENTENCEPIECE_SPACE, "Ġ", " "}
+    # Also infer prefixes from payload tokens.
+    for tok in token_set:
+        if tok and not tok[0].isalnum():
+            prefix_chars.add(tok[0])
+
+    candidates: Set[str] = set()
+    for base in base_variants:
+        candidates.add(base)
+        for p in prefix_chars:
+            candidates.add(f"{p}{base}")
+    return candidates
+
+
 def _resolve_model_width_from_result(
     result_payload: Dict[str, Any],
     fallback_model: str,
@@ -342,6 +386,7 @@ def _compute_file_counter(
     result_payload: Dict[str, Any],
     token_set: Set[str],
     activations: Sequence[Dict[str, Any]],
+    count_token_source: str,
 ) -> Dict[str, int]:
     counter = _new_counter()
     counter["result_file_count"] = 1
@@ -380,14 +425,29 @@ def _compute_file_counter(
                 continue
 
             counter["eligible_intervention_count"] += 1
-            if sample_activation is None:
-                counter["skipped_missing_activation_count"] += 1
-                continue
-            if not next_token:
-                counter["skipped_missing_next_token_count"] += 1
-                continue
-            if next_token in token_set:
-                counter["hit_count"] += 1
+            if str(count_token_source) == "generated":
+                steered_output = intervention.get("steered_output", {})
+                if not isinstance(steered_output, dict):
+                    counter["skipped_missing_next_token_count"] += 1
+                    continue
+                piece = _extract_first_generated_piece(
+                    str(steered_output.get("completion_text", ""))
+                )
+                if not piece:
+                    counter["skipped_missing_next_token_count"] += 1
+                    continue
+                candidates = _candidate_generated_tokens(piece, token_set)
+                if any(candidate in token_set for candidate in candidates):
+                    counter["hit_count"] += 1
+            else:
+                if sample_activation is None:
+                    counter["skipped_missing_activation_count"] += 1
+                    continue
+                if not next_token:
+                    counter["skipped_missing_next_token_count"] += 1
+                    continue
+                if next_token in token_set:
+                    counter["hit_count"] += 1
 
     return counter
 
@@ -482,6 +542,7 @@ def main() -> None:
                     result_payload=result_payload,
                     token_set=token_set,
                     activations=activations,
+                    count_token_source=str(args.count_token_source),
                 )
 
                 _add_counter(overall_counter, file_counter)
@@ -543,6 +604,7 @@ def main() -> None:
                 for layer_id, feature_id in pairs
             ],
             "result_filename": str(args.result_filename),
+            "count_token_source": str(args.count_token_source),
         },
         "overall": _finalize_counter(overall_counter),
         "by_feature": by_feature,

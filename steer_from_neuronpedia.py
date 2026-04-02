@@ -276,10 +276,67 @@ def _find_sentence_start_token_idx(tokens: Sequence[str], max_idx: int) -> int:
     return 0
 
 
+def _find_positive_activation_positions(values: Sequence[Any], threshold: float = EPS) -> List[int]:
+    positions: List[int] = []
+    for idx, raw_value in enumerate(values):
+        if _to_float(raw_value, default=0.0) > float(threshold):
+            positions.append(int(idx))
+    return positions
+
+
+def _build_legacy_truncation_info(
+    *,
+    tokens: Sequence[str],
+    declared_max: float,
+    values: Sequence[Any],
+    fallback_idx: Optional[int],
+    max_prefix_tokens: int,
+) -> Dict[str, Any]:
+    max_idx = _find_first_max_index(values, declared_max, fallback_idx)
+    max_idx = max(0, min(max_idx, len(tokens) - 1))
+
+    sentence_start = _find_sentence_start_token_idx(tokens, max_idx)
+    max_prefix_tokens = max(0, int(max_prefix_tokens))
+    window_start = max(sentence_start, max_idx - max_prefix_tokens)
+    window_end = max_idx
+
+    truncated_tokens = list(tokens[window_start : window_end + 1])
+    prompt_text = "".join(truncated_tokens).strip()
+    if not prompt_text:
+        prompt_text = "".join(tokens[: max_idx + 1]).strip()
+
+    return {
+        "prompt_text": prompt_text,
+        "max_token": str(tokens[max_idx]),
+        "max_value": declared_max,
+        "max_token_index": max_idx,
+        "sentence_start_index": sentence_start,
+        "window_start_index": window_start,
+        "window_end_index": window_end,
+        "window_token_count": len(truncated_tokens),
+        "source_sentence": "".join(tokens),
+        "source_token_count": len(tokens),
+        "truncation_strategy": "legacy_first_max_token",
+        "neuronpedia_support_positions": [],
+        "support_start_index": max_idx,
+        "support_end_index": max_idx,
+        "support_start_token": str(tokens[max_idx]),
+        "support_end_token": str(tokens[max_idx]),
+        "support_token_count": 0,
+        "covered_support_positions": [],
+        "covered_support_count": 0,
+        "support_window_start_index": window_start,
+        "support_window_end_index": window_end,
+        "support_window_token_count": len(truncated_tokens),
+        "support_span_fallback_used": True,
+    }
+
+
 def _truncate_prompt_from_activation(
     activation: Dict[str, Any],
     *,
     max_prefix_tokens: int,
+    scope: str,
 ) -> Dict[str, Any]:
     tokens_raw = activation.get("tokens", [])
     values_raw = activation.get("values", [])
@@ -298,34 +355,85 @@ def _truncate_prompt_from_activation(
             "max_token_index": 0,
             "sentence_start_index": 0,
             "window_start_index": 0,
+            "window_end_index": 0,
             "window_token_count": 0,
             "source_sentence": "",
             "source_token_count": 0,
+            "truncation_strategy": "empty_tokens",
+            "neuronpedia_support_positions": [],
+            "support_start_index": 0,
+            "support_end_index": 0,
+            "support_start_token": "",
+            "support_end_token": "",
+            "support_token_count": 0,
+            "covered_support_positions": [],
+            "covered_support_count": 0,
+            "support_window_start_index": 0,
+            "support_window_end_index": 0,
+            "support_window_token_count": 0,
+            "support_span_fallback_used": False,
         }
+
+    if str(scope) != "natural_support_mask":
+        return _build_legacy_truncation_info(
+            tokens=tokens,
+            declared_max=declared_max,
+            values=values,
+            fallback_idx=fallback_idx,
+            max_prefix_tokens=max_prefix_tokens,
+        )
+
+    support_positions = _find_positive_activation_positions(values, threshold=EPS)
+    if not support_positions:
+        legacy = _build_legacy_truncation_info(
+            tokens=tokens,
+            declared_max=declared_max,
+            values=values,
+            fallback_idx=fallback_idx,
+            max_prefix_tokens=max_prefix_tokens,
+        )
+        legacy["truncation_strategy"] = "natural_support_mask_fallback_legacy_first_max_token"
+        legacy["support_span_fallback_used"] = True
+        return legacy
+
+    support_start = max(0, min(int(support_positions[0]), len(tokens) - 1))
+    support_end = max(0, min(int(support_positions[-1]), len(tokens) - 1))
+    sentence_start = _find_sentence_start_token_idx(tokens, support_start)
+    max_prefix_tokens = max(0, int(max_prefix_tokens))
+    window_start = max(sentence_start, support_start - max_prefix_tokens)
+    window_end = support_end
+
+    truncated_tokens = list(tokens[window_start : window_end + 1])
+    prompt_text = "".join(truncated_tokens).strip()
+    if not prompt_text:
+        prompt_text = "".join(tokens[window_start : support_end + 1]).strip()
 
     max_idx = _find_first_max_index(values, declared_max, fallback_idx)
     max_idx = max(0, min(max_idx, len(tokens) - 1))
-
-    sentence_start = _find_sentence_start_token_idx(tokens, max_idx)
-    max_prefix_tokens = max(0, int(max_prefix_tokens))
-    window_start = max(sentence_start, max_idx - max_prefix_tokens)
-
-    truncated_tokens = tokens[window_start : max_idx + 1]
-    prompt_text = "".join(truncated_tokens).strip()
-    if not prompt_text:
-        prompt_text = "".join(tokens[: max_idx + 1]).strip()
-
-    max_token = tokens[max_idx]
     return {
         "prompt_text": prompt_text,
-        "max_token": max_token,
+        "max_token": str(tokens[max_idx]),
         "max_value": declared_max,
         "max_token_index": max_idx,
         "sentence_start_index": sentence_start,
         "window_start_index": window_start,
+        "window_end_index": window_end,
         "window_token_count": len(truncated_tokens),
         "source_sentence": "".join(tokens),
         "source_token_count": len(tokens),
+        "truncation_strategy": "natural_support_span",
+        "neuronpedia_support_positions": support_positions,
+        "support_start_index": support_start,
+        "support_end_index": support_end,
+        "support_start_token": str(tokens[support_start]),
+        "support_end_token": str(tokens[support_end]),
+        "support_token_count": len(support_positions),
+        "covered_support_positions": support_positions,
+        "covered_support_count": len(support_positions),
+        "support_window_start_index": window_start,
+        "support_window_end_index": window_end,
+        "support_window_token_count": len(truncated_tokens),
+        "support_span_fallback_used": False,
     }
 
 
@@ -984,6 +1092,7 @@ def run_neuronpedia_steer(
         trunc_info = _truncate_prompt_from_activation(
             activation,
             max_prefix_tokens=max(0, int(args.max_prefix_tokens)),
+            scope=str(args.intervention_scope),
         )
         prompt_text = str(trunc_info["prompt_text"])
         input_ids, attention_mask = _prepare_prompt_tensors(module, prompt_text)

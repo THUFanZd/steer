@@ -3,6 +3,15 @@ from __future__ import annotations
 from typing import Tuple
 
 
+ALL_INTERVENTION_SCOPES: Tuple[str, ...] = (
+    "all_tokens",
+    "last_token_only",
+    "all_original_tokens",
+    "last_original_token_only",
+    "natural_support_mask",
+)
+
+
 # steer_from_neuronpedia.py defaults
 STEER_DEFAULT_MODEL_ID = "gemma-2-2b"
 STEER_DEFAULT_LLM_NAME = "google/gemma-2-2b"
@@ -14,7 +23,7 @@ STEER_DEFAULT_MAX_NEW_TOKENS = 80
 STEER_DEFAULT_INTERVENTION_SCOPE = "last_token_only"
 STEER_DEFAULT_INTERVENTION_STEPS = 1
 STEER_DEFAULT_TOP_K_EXAMPLES = 3
-STEER_DEFAULT_MAX_PREFIX_TOKENS = 20
+STEER_DEFAULT_MAX_PREFIX_TOKENS = 100
 STEER_DEFAULT_STRENGTH_SCALES: Tuple[float, ...] = (0.0, 2.0 / 3.0, 1.5)
 STEER_DEFAULT_TIMEOUT = 30
 STEER_DEFAULT_OUTPUT_ROOT = "outputs"

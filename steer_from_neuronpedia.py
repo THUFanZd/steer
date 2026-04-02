@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import requests
 import torch
 from default_arg_values import (
+    ALL_INTERVENTION_SCOPES,
     STEER_DEFAULT_DEVICE,
     STEER_DEFAULT_INTERVENTION_SCOPE,
     STEER_DEFAULT_INTERVENTION_STEPS,
@@ -37,6 +38,7 @@ from function import DEFAULT_CANONICAL_MAP_PATH, build_default_sae_path
 
 SENTENCE_END_RE = re.compile(r"[.!?。！？]")
 EPS = 1e-8
+NSM_ACTIVATION_THRESHOLD = EPS
 NEURONPEDIA_BASE_URL = "https://www.neuronpedia.org"
 
 
@@ -66,12 +68,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--intervention-scope",
         type=str,
-        choices=(
-            "all_tokens",
-            "last_token_only",
-            "all_original_tokens",
-            "last_original_token_only",
-        ),
+        choices=ALL_INTERVENTION_SCOPES,
         default=STEER_DEFAULT_INTERVENTION_SCOPE,
     )
     parser.add_argument(
@@ -388,26 +385,84 @@ def _run_base_logits(
     return outputs.logits
 
 
-def _build_original_scope_value_tensor(
+def _build_prompt_position_value_tensor(
     *,
     seq_len: int,
-    prompt_len: int,
+    prompt_positions: Sequence[int],
     steer_value: float,
-    scope: str,
     device: torch.device,
 ) -> torch.Tensor:
     value = torch.zeros((1, int(seq_len)), dtype=torch.float32, device=device)
-    effective_prompt_len = max(0, min(int(prompt_len), int(seq_len)))
-    if effective_prompt_len <= 0:
+    if int(seq_len) <= 0:
         return value
+    for pos in prompt_positions:
+        idx = int(pos)
+        if 0 <= idx < int(seq_len):
+            value[:, idx] = float(steer_value)
+    return value
 
+
+def _resolve_prompt_positions_for_scope(
+    *,
+    scope: str,
+    prompt_len: int,
+    nsm_positions: Optional[Sequence[int]] = None,
+) -> List[int]:
+    effective_prompt_len = max(0, int(prompt_len))
+    if effective_prompt_len <= 0:
+        return []
     if scope == "all_original_tokens":
-        value[:, :effective_prompt_len] = float(steer_value)
-        return value
+        return list(range(effective_prompt_len))
     if scope == "last_original_token_only":
-        value[:, effective_prompt_len - 1] = float(steer_value)
-        return value
-    raise ValueError(f"Unsupported original-token scope: {scope}")
+        return [effective_prompt_len - 1]
+    if scope == "natural_support_mask":
+        if not nsm_positions:
+            return []
+        return sorted(
+            {
+                int(pos)
+                for pos in nsm_positions
+                if 0 <= int(pos) < effective_prompt_len
+            }
+        )
+    raise ValueError(f"Unsupported prompt-only scope: {scope}")
+
+
+def _build_natural_support_metadata(
+    *,
+    trace: Dict[str, Any],
+    prompt_len: int,
+    threshold: float = NSM_ACTIVATION_THRESHOLD,
+) -> Dict[str, Any]:
+    per_token_activation = trace.get("per_token_activation", [])
+    tokens = trace.get("tokens", [])
+    selected_positions: List[int] = []
+    selected_activations: List[float] = []
+    selected_tokens: List[str] = []
+
+    if isinstance(per_token_activation, list):
+        limit = min(len(per_token_activation), max(0, int(prompt_len)))
+        for idx in range(limit):
+            activation = _to_float(per_token_activation[idx], default=0.0)
+            if activation <= float(threshold):
+                continue
+            selected_positions.append(int(idx))
+            selected_activations.append(float(activation))
+            if isinstance(tokens, list) and idx < len(tokens):
+                selected_tokens.append(str(tokens[idx]))
+            else:
+                selected_tokens.append("")
+
+    return {
+        "activation_threshold": float(threshold),
+        "selected_positions": selected_positions,
+        "selected_count": len(selected_positions),
+        "selected_activations": selected_activations,
+        "selected_tokens": selected_tokens,
+        "trace_token_count": len(tokens) if isinstance(tokens, list) else 0,
+        "trace_activation_count": len(per_token_activation) if isinstance(per_token_activation, list) else 0,
+        "prompt_token_count": max(0, int(prompt_len)),
+    }
 
 
 @torch.no_grad()
@@ -420,6 +475,7 @@ def _run_steered_logits(
     steer_value: float,
     scope: str,
     prompt_len: int,
+    prompt_positions: Optional[Sequence[int]] = None,
 ) -> torch.Tensor:
     if scope in {"all_tokens", "last_token_only"}:
         return module.run_logits_with_feature_intervention(
@@ -431,11 +487,15 @@ def _run_steered_logits(
             intervention_scope=str(scope),
         )
 
-    value_tensor = _build_original_scope_value_tensor(
-        seq_len=int(input_ids.shape[1]),
-        prompt_len=int(prompt_len),
-        steer_value=float(steer_value),
+    resolved_prompt_positions = _resolve_prompt_positions_for_scope(
         scope=str(scope),
+        prompt_len=int(prompt_len),
+        nsm_positions=prompt_positions,
+    )
+    value_tensor = _build_prompt_position_value_tensor(
+        seq_len=int(input_ids.shape[1]),
+        prompt_positions=resolved_prompt_positions,
+        steer_value=float(steer_value),
         device=input_ids.device,
     )
     return module.run_logits_with_feature_intervention(
@@ -460,6 +520,7 @@ def _generate_text(
     steer_value: Optional[float] = None,
     intervention_scope: str = "last_token_only",
     intervention_steps: int = 1,
+    prompt_positions: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
     tokens = input_ids.clone()
     mask = attention_mask.clone()
@@ -482,6 +543,7 @@ def _generate_text(
                 steer_value=float(steer_value),
                 scope=str(intervention_scope),
                 prompt_len=prompt_len,
+                prompt_positions=prompt_positions,
             )
         else:
             logits = _run_base_logits(module, input_ids=tokens, attention_mask=mask)
@@ -689,6 +751,7 @@ def _collect_logit_shift_trace(
     steer_value: float,
     intervention_scope: str,
     intervention_steps: int,
+    prompt_positions: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
     reference_ids = [int(x) for x in reference_completion_token_ids]
     steps_to_analyze = max(0, min(int(max_steps), len(reference_ids)))
@@ -724,6 +787,7 @@ def _collect_logit_shift_trace(
                 steer_value=float(steer_value),
                 scope=str(intervention_scope),
                 prompt_len=prompt_len,
+                prompt_positions=prompt_positions,
             )
             steered_next = steered_full[:, -1, :].detach().float().squeeze(0).cpu()
         else:
@@ -943,6 +1007,15 @@ def run_neuronpedia_steer(
             last_prompt_token_activation = _to_float(per_token_activation[-1], default=0.0)
         else:
             last_prompt_token_activation = 0.0
+        natural_support = _build_natural_support_metadata(
+            trace=trace,
+            prompt_len=int(input_ids.shape[1]),
+        )
+        prompt_positions: Optional[List[int]]
+        if str(args.intervention_scope) == "natural_support_mask":
+            prompt_positions = list(natural_support["selected_positions"])
+        else:
+            prompt_positions = None
 
         neuronpedia_max_value = _to_float(trunc_info["max_value"], default=0.0)
         base_activation, base_source = _resolve_strength_base(
@@ -964,6 +1037,7 @@ def run_neuronpedia_steer(
                 steer_value=steer_value,
                 intervention_scope=str(args.intervention_scope),
                 intervention_steps=max(0, int(args.intervention_steps)),
+                prompt_positions=prompt_positions,
             )
             steered_completion_token_ids = steered_output.get("completion_token_ids", [])
 
@@ -988,6 +1062,7 @@ def run_neuronpedia_steer(
                     steer_value=steer_value,
                     intervention_scope=str(args.intervention_scope),
                     intervention_steps=max(0, int(args.intervention_steps)),
+                    prompt_positions=prompt_positions,
                 )
             else:
                 logit_analysis = {
@@ -1014,6 +1089,8 @@ def run_neuronpedia_steer(
                 "activation_original_index": int(selected_indices[rank - 1]),
                 "truncated_prompt": trunc_info,
                 "prompt_last_token_activation": float(last_prompt_token_activation),
+                "prompt_activation_trace": trace,
+                "natural_support_mask": natural_support,
                 "strength_base_activation": float(base_activation),
                 "strength_base_source": str(base_source),
                 "clean_output": clean_output,

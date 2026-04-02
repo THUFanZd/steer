@@ -19,6 +19,7 @@ SCOPES = {
     "last_token_only",
     "all_original_tokens",
     "last_original_token_only",
+    "natural_support_mask",
 }
 SENTENCEPIECE_SPACE = chr(9601)  # '▁'
 

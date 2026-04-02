@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
 
 from default_arg_values import (
+    ALL_INTERVENTION_SCOPES,
     BATCH_DEFAULT_DEVICE,
     BATCH_DEFAULT_LLM_NAME,
     BATCH_DEFAULT_OUTPUT_ROOT,
@@ -136,7 +137,7 @@ def parse_list_file(path: Path) -> List[str]:
 
 
 def normalize_scopes(scopes: Sequence[str]) -> List[str]:
-    allowed = set(BATCH_DEFAULT_SCOPES)
+    allowed = set(ALL_INTERVENTION_SCOPES)
     normalized: List[str] = []
     for scope in scopes:
         s = str(scope).strip()
@@ -144,7 +145,7 @@ def normalize_scopes(scopes: Sequence[str]) -> List[str]:
             continue
         if s not in allowed:
             raise ValueError(
-                f"Unsupported scope: {s}. Allowed scopes: {', '.join(BATCH_DEFAULT_SCOPES)}"
+                f"Unsupported scope: {s}. Allowed scopes: {', '.join(ALL_INTERVENTION_SCOPES)}"
             )
         normalized.append(s)
     if not normalized:

@@ -10,6 +10,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
 
+from default_arg_values import (
+    BATCH_DEFAULT_DEVICE,
+    BATCH_DEFAULT_LLM_NAME,
+    BATCH_DEFAULT_OUTPUT_ROOT,
+    BATCH_DEFAULT_PYTHON_EXE,
+    BATCH_DEFAULT_SAE_ROOT,
+    BATCH_DEFAULT_SCOPES,
+    BATCH_DEFAULT_SCRIPT_PATH,
+    BATCH_DEFAULT_STEPS,
+    BATCH_DEFAULT_STRENGTH_SCALES,
+    BATCH_DEFAULT_TOP_K_EXAMPLES,
+    BATCH_DEFAULT_WIDTH,
+)
 from tqdm import tqdm
 
 try:
@@ -22,14 +35,6 @@ except ModuleNotFoundError as exc:
     sys.modules.setdefault("openai", openai_stub)
     from function import DEFAULT_CANONICAL_MAP_PATH, extract_average_l0_from_canonical_map
 
-DEFAULT_STEPS = (1, 5, 999)
-DEFAULT_SCOPES = (
-    "all_tokens",
-    "last_token_only",
-    "all_original_tokens",
-    "last_original_token_only",
-)
-DEFAULT_STRENGTH_SCALES = ("-1", "-3", "1", "-5", "3") #"-1/3", "0.5",
 PAIR_PATTERNS = (
     re.compile(r"^\s*(\d+)\s*[,\t ]\s*(\d+)\s*$"),
     re.compile(r"^\s*\(?\s*(\d+)\s*,\s*(\d+)\s*\)?\s*$"),
@@ -58,24 +63,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional file containing strength scales. One or more values per line.",
     )
-    parser.add_argument("--python-exe", type=str, default="python")  # sys.executable or 
-    parser.add_argument("--script-path", type=Path, default=Path("steer_from_neuronpedia.py"))
-    parser.add_argument("--output-root", type=Path, default=Path("outputs"))
+    parser.add_argument("--python-exe", type=str, default=BATCH_DEFAULT_PYTHON_EXE)  # sys.executable or 
+    parser.add_argument("--script-path", type=Path, default=Path(BATCH_DEFAULT_SCRIPT_PATH))
+    parser.add_argument("--output-root", type=Path, default=Path(BATCH_DEFAULT_OUTPUT_ROOT))
     parser.add_argument(
         "--run-id",
         type=str,
         default=None,
         help="Optional run folder under output-root. Defaults to current timestamp.",
     )
-    parser.add_argument("--llm-name", type=str, default="/data/MODEL/Gemma-2-2b")
-    parser.add_argument("--sae-root", type=Path, default=Path("/data/MODEL/gemma-scope-2b-pt-res"))
+    parser.add_argument("--llm-name", type=str, default=BATCH_DEFAULT_LLM_NAME)
+    parser.add_argument("--sae-root", type=Path, default=Path(BATCH_DEFAULT_SAE_ROOT))
     parser.add_argument("--canonical-map-path", type=Path, default=DEFAULT_CANONICAL_MAP_PATH)
-    parser.add_argument("--width", type=str, default="16k")
-    parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--top-k-examples", type=int, default=3)
-    parser.add_argument("--steps", nargs="*", type=int, default=list(DEFAULT_STEPS))
-    parser.add_argument("--scopes", nargs="*", default=list(DEFAULT_SCOPES))
-    parser.add_argument("--strength-scales", nargs="*", default=list(DEFAULT_STRENGTH_SCALES))
+    parser.add_argument("--width", type=str, default=BATCH_DEFAULT_WIDTH)
+    parser.add_argument("--device", type=str, default=BATCH_DEFAULT_DEVICE)
+    parser.add_argument("--top-k-examples", type=int, default=BATCH_DEFAULT_TOP_K_EXAMPLES)
+    parser.add_argument("--steps", nargs="*", type=int, default=list(BATCH_DEFAULT_STEPS))
+    parser.add_argument("--scopes", nargs="*", default=list(BATCH_DEFAULT_SCOPES))
+    parser.add_argument("--strength-scales", nargs="*", default=list(BATCH_DEFAULT_STRENGTH_SCALES))
     parser.add_argument("--extra-args", nargs=argparse.REMAINDER, default=[])
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
@@ -131,7 +136,7 @@ def parse_list_file(path: Path) -> List[str]:
 
 
 def normalize_scopes(scopes: Sequence[str]) -> List[str]:
-    allowed = set(DEFAULT_SCOPES)
+    allowed = set(BATCH_DEFAULT_SCOPES)
     normalized: List[str] = []
     for scope in scopes:
         s = str(scope).strip()
@@ -139,7 +144,7 @@ def normalize_scopes(scopes: Sequence[str]) -> List[str]:
             continue
         if s not in allowed:
             raise ValueError(
-                f"Unsupported scope: {s}. Allowed scopes: {', '.join(DEFAULT_SCOPES)}"
+                f"Unsupported scope: {s}. Allowed scopes: {', '.join(BATCH_DEFAULT_SCOPES)}"
             )
         normalized.append(s)
     if not normalized:

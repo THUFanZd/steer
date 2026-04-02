@@ -13,6 +13,26 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import requests
 import torch
+from default_arg_values import (
+    STEER_DEFAULT_DEVICE,
+    STEER_DEFAULT_INTERVENTION_SCOPE,
+    STEER_DEFAULT_INTERVENTION_STEPS,
+    STEER_DEFAULT_LLM_NAME,
+    STEER_DEFAULT_LOGIT_ANALYSIS_MAX_STEPS,
+    STEER_DEFAULT_LOGIT_ANALYSIS_REFERENCE,
+    STEER_DEFAULT_LOGIT_ANALYSIS_TOP_K,
+    STEER_DEFAULT_MAX_NEW_TOKENS,
+    STEER_DEFAULT_MAX_PREFIX_TOKENS,
+    STEER_DEFAULT_MODEL_ID,
+    STEER_DEFAULT_OUTPUT_FILENAME,
+    STEER_DEFAULT_OUTPUT_ROOT,
+    STEER_DEFAULT_SAE_RELEASE,
+    STEER_DEFAULT_STRENGTH_SCALES,
+    STEER_DEFAULT_TEMPERATURE,
+    STEER_DEFAULT_TIMEOUT,
+    STEER_DEFAULT_TOP_K_EXAMPLES,
+    STEER_DEFAULT_WIDTH,
+)
 from function import DEFAULT_CANONICAL_MAP_PATH, build_default_sae_path
 
 SENTENCE_END_RE = re.compile(r"[.!?。！？]")
@@ -29,10 +49,10 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--layer-id", type=int, required=True)
     parser.add_argument("--feature-id", type=int, required=True)
-    parser.add_argument("--model-id", type=str, default="gemma-2-2b", help="Neuronpedia model id.")
-    parser.add_argument("--llm-name", type=str, default="google/gemma-2-2b", help="HF model name/path.")
-    parser.add_argument("--width", type=str, default="16k")
-    parser.add_argument("--sae-release", type=str, default="gemma-scope-2b-pt-res")
+    parser.add_argument("--model-id", type=str, default=STEER_DEFAULT_MODEL_ID, help="Neuronpedia model id.")
+    parser.add_argument("--llm-name", type=str, default=STEER_DEFAULT_LLM_NAME, help="HF model name/path.")
+    parser.add_argument("--width", type=str, default=STEER_DEFAULT_WIDTH)
+    parser.add_argument("--sae-release", type=str, default=STEER_DEFAULT_SAE_RELEASE)
     parser.add_argument(
         "--sae-path",
         type=str,
@@ -40,9 +60,9 @@ def _parse_args() -> argparse.Namespace:
         help="Optional local SAE checkpoint path (directory or file). If provided, this takes priority over --sae-release/--width canonical mapping.",
     )
     parser.add_argument("--canonical-map-path", type=str, default=str(DEFAULT_CANONICAL_MAP_PATH))
-    parser.add_argument("--device", type=str, default="cpu")     
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-new-tokens", type=int, default=80)
+    parser.add_argument("--device", type=str, default=STEER_DEFAULT_DEVICE)
+    parser.add_argument("--temperature", type=float, default=STEER_DEFAULT_TEMPERATURE)
+    parser.add_argument("--max-new-tokens", type=int, default=STEER_DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument(
         "--intervention-scope",
         type=str,
@@ -52,16 +72,16 @@ def _parse_args() -> argparse.Namespace:
             "all_original_tokens",
             "last_original_token_only",
         ),
-        default="last_token_only",
+        default=STEER_DEFAULT_INTERVENTION_SCOPE,
     )
     parser.add_argument(
         "--intervention-steps",
         type=int,
-        default=1,
+        default=STEER_DEFAULT_INTERVENTION_STEPS,
         help="Apply steering only for the first N predicted tokens, then continue with clean decoding.",
     )
-    parser.add_argument("--top-k-examples", type=int, default=3)
-    parser.add_argument("--max-prefix-tokens", type=int, default=20)
+    parser.add_argument("--top-k-examples", type=int, default=STEER_DEFAULT_TOP_K_EXAMPLES)
+    parser.add_argument("--max-prefix-tokens", type=int, default=STEER_DEFAULT_MAX_PREFIX_TOKENS)
     parser.add_argument(
         "--strength-scales",
         type=str,
@@ -73,9 +93,9 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--neuronpedia-api-key", type=str, default=None)
-    parser.add_argument("--timeout", type=int, default=30)
-    parser.add_argument("--output-root", type=str, default="outputs")
-    parser.add_argument("--output-filename", type=str, default="steer_from_neuronpedia.json")
+    parser.add_argument("--timeout", type=int, default=STEER_DEFAULT_TIMEOUT)
+    parser.add_argument("--output-root", type=str, default=STEER_DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--output-filename", type=str, default=STEER_DEFAULT_OUTPUT_FILENAME)
     parser.add_argument(
         "--disable-logit-analysis",
         action="store_true",
@@ -84,20 +104,20 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--logit-analysis-max-steps",
         type=int,
-        default=8,
+        default=STEER_DEFAULT_LOGIT_ANALYSIS_MAX_STEPS,
         help="Maximum generation steps to analyze for logits shifts.",
     )
     parser.add_argument(
         "--logit-analysis-top-k",
         type=int,
-        default=10,
+        default=STEER_DEFAULT_LOGIT_ANALYSIS_TOP_K,
         help="Top-k tokens to report for positive/negative logits deltas per step.",
     )
     parser.add_argument(
         "--logit-analysis-reference",
         type=str,
         choices=("clean", "steered"),
-        default="clean",
+        default=STEER_DEFAULT_LOGIT_ANALYSIS_REFERENCE,
         help="Reference trajectory used for teacher-forced logits analysis.",
     )
     parser.add_argument(
@@ -176,7 +196,7 @@ def _parse_single_scale(text: str) -> float:
 
 def _resolve_strength_scales(raw_scales: Optional[Sequence[str]]) -> List[float]:
     if not raw_scales:
-        return [0.0, 2.0 / 3.0, 1.5]
+        return [float(x) for x in STEER_DEFAULT_STRENGTH_SCALES]
 
     parsed: List[float] = []
     for item in raw_scales:

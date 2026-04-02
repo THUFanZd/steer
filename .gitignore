@@ -1,4 +1,5 @@
 outputs/
 __pycache__/
-run_steer_batch.py
 pairs.txt
+scales.txt
+steps.txt

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import time
 from tqdm import tqdm
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import requests
 import torch
@@ -75,6 +76,35 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--output-root", type=str, default="outputs")
     parser.add_argument("--output-filename", type=str, default="steer_from_neuronpedia.json")
+    parser.add_argument(
+        "--disable-logit-analysis",
+        action="store_true",
+        help="Disable logits-delta analysis between clean and steered runs.",
+    )
+    parser.add_argument(
+        "--logit-analysis-max-steps",
+        type=int,
+        default=8,
+        help="Maximum generation steps to analyze for logits shifts.",
+    )
+    parser.add_argument(
+        "--logit-analysis-top-k",
+        type=int,
+        default=10,
+        help="Top-k tokens to report for positive/negative logits deltas per step.",
+    )
+    parser.add_argument(
+        "--logit-analysis-reference",
+        type=str,
+        choices=("clean", "steered"),
+        default="clean",
+        help="Reference trajectory used for teacher-forced logits analysis.",
+    )
+    parser.add_argument(
+        "--logit-analysis-include-special-tokens",
+        action="store_true",
+        help="Include tokenizer special tokens in top-k logits-delta lists.",
+    )
     return parser.parse_args()
 
 
@@ -447,10 +477,330 @@ def _generate_text(
     completion_ids = tokens[0, prompt_len:]
     completion_text = module.tokenizer.decode(completion_ids, skip_special_tokens=True)
     full_text = module.tokenizer.decode(tokens[0], skip_special_tokens=True)
+    completion_id_list = [int(x) for x in completion_ids.detach().cpu().tolist()]
+    try:
+        completion_tokens = [str(tok) for tok in module.tokenizer.convert_ids_to_tokens(completion_id_list)]
+    except Exception:
+        completion_tokens = [str(x) for x in completion_id_list]
     return {
         "completion_text": completion_text,
         "full_text": full_text,
         "generated_token_count": int(completion_ids.numel()),
+        "completion_token_ids": completion_id_list,
+        "completion_tokens": completion_tokens,
+    }
+
+
+def _safe_decode_token(tokenizer: Any, token_id: int) -> str:
+    try:
+        token = tokenizer.convert_ids_to_tokens([int(token_id)])
+        if isinstance(token, list) and token:
+            return str(token[0])
+    except Exception:
+        pass
+    return str(int(token_id))
+
+
+def _build_special_token_id_set(tokenizer: Any, vocab_size: int) -> Set[int]:
+    special_ids: Set[int] = set()
+    if tokenizer is None or not hasattr(tokenizer, "all_special_ids"):
+        return special_ids
+    for token_id in getattr(tokenizer, "all_special_ids", []):
+        try:
+            idx = int(token_id)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < int(vocab_size):
+            special_ids.add(idx)
+    return special_ids
+
+
+def _safe_token_rank_desc(logits: torch.Tensor, token_id: int) -> int:
+    if logits.ndim != 1:
+        raise ValueError("logits must be 1-D for ranking.")
+    vocab_size = int(logits.shape[0])
+    if token_id < 0 or token_id >= vocab_size:
+        return vocab_size + 1
+    token_score = logits[token_id]
+    higher = int((logits > token_score).sum().item())
+    return higher + 1
+
+
+def _collect_top_delta_records(
+    *,
+    module: Any,
+    delta_logits: torch.Tensor,
+    clean_logits: torch.Tensor,
+    steered_logits: torch.Tensor,
+    clean_probs: torch.Tensor,
+    steered_probs: torch.Tensor,
+    top_k: int,
+    special_token_ids: Set[int],
+    include_special_tokens: bool,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    if delta_logits.ndim != 1:
+        raise ValueError("delta_logits must be 1-D.")
+    vocab_size = int(delta_logits.shape[0])
+    k = max(0, min(int(top_k), vocab_size))
+    if k <= 0:
+        return [], []
+
+    positive_scores = delta_logits.clone()
+    negative_scores = delta_logits.clone()
+    if not include_special_tokens and special_token_ids:
+        special_indices = torch.tensor(sorted(special_token_ids), dtype=torch.long, device=delta_logits.device)
+        positive_scores.index_fill_(0, special_indices, float("-inf"))
+        negative_scores.index_fill_(0, special_indices, float("inf"))
+
+    pos_vals, pos_ids = torch.topk(positive_scores, k=k, largest=True)
+    neg_vals, neg_ids = torch.topk(negative_scores, k=k, largest=False)
+
+    def _build_records(token_ids: torch.Tensor, delta_vals: torch.Tensor) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        for idx, delta_val in zip(token_ids.tolist(), delta_vals.tolist()):
+            if not math.isfinite(float(delta_val)):
+                continue
+            token_id = int(idx)
+            records.append(
+                {
+                    "token_id": token_id,
+                    "token": _safe_decode_token(module.tokenizer, token_id),
+                    "delta_logit": float(delta_logits[token_id].item()),
+                    "clean_logit": float(clean_logits[token_id].item()),
+                    "steered_logit": float(steered_logits[token_id].item()),
+                    "clean_prob": float(clean_probs[token_id].item()),
+                    "steered_prob": float(steered_probs[token_id].item()),
+                }
+            )
+        return records
+
+    return _build_records(pos_ids, pos_vals), _build_records(neg_ids, neg_vals)
+
+
+def _jaccard_similarity(a: Set[int], b: Set[int]) -> float:
+    if not a and not b:
+        return 1.0
+    union = a | b
+    if not union:
+        return 0.0
+    inter = a & b
+    return float(len(inter) / len(union))
+
+
+def _first_step_below_ratio(values: Sequence[float], ratio: float) -> Optional[int]:
+    if not values:
+        return None
+    base = float(values[0])
+    if abs(base) <= EPS:
+        return 0
+    threshold = abs(base) * float(ratio)
+    for idx, value in enumerate(values):
+        if abs(float(value)) <= threshold:
+            return int(idx)
+    return None
+
+
+def _summarize_logit_shift_steps(step_records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    if not step_records:
+        return {
+            "observed_steps": 0,
+            "argmax_switch_rate": 0.0,
+            "mean_js_divergence": 0.0,
+            "max_js_divergence": 0.0,
+            "max_js_step": None,
+            "mean_reference_rank_lift": 0.0,
+            "mean_reference_prob_delta": 0.0,
+            "mean_delta_l2": 0.0,
+            "step0_top_positive_persistence_jaccard": 0.0,
+            "half_life_step_l2_ratio_0_5": None,
+        }
+
+    delta_l2_values = [float(step.get("delta_l2", 0.0)) for step in step_records]
+    js_values = [float(step.get("js_divergence", 0.0)) for step in step_records]
+    rank_lifts = [float(step.get("reference_rank_lift", 0.0)) for step in step_records]
+    reference_prob_deltas = [float(step.get("reference_delta_prob", 0.0)) for step in step_records]
+    argmax_switches = [1.0 if bool(step.get("argmax_changed", False)) else 0.0 for step in step_records]
+
+    max_js = max(js_values) if js_values else 0.0
+    max_js_step = js_values.index(max_js) if js_values else None
+
+    top_positive_sets: List[Set[int]] = []
+    for step in step_records:
+        ids = {
+            int(item.get("token_id"))
+            for item in step.get("top_positive_delta_tokens", [])
+            if isinstance(item, dict) and "token_id" in item
+        }
+        top_positive_sets.append(ids)
+
+    step0_set = top_positive_sets[0] if top_positive_sets else set()
+    if top_positive_sets:
+        persistence_scores = [_jaccard_similarity(step0_set, current) for current in top_positive_sets]
+        mean_persistence = float(sum(persistence_scores) / len(persistence_scores))
+    else:
+        mean_persistence = 0.0
+
+    return {
+        "observed_steps": len(step_records),
+        "argmax_switch_rate": float(sum(argmax_switches) / len(argmax_switches)),
+        "mean_js_divergence": float(sum(js_values) / len(js_values)),
+        "max_js_divergence": float(max_js),
+        "max_js_step": int(max_js_step) if max_js_step is not None else None,
+        "mean_reference_rank_lift": float(sum(rank_lifts) / len(rank_lifts)),
+        "mean_reference_prob_delta": float(sum(reference_prob_deltas) / len(reference_prob_deltas)),
+        "mean_delta_l2": float(sum(delta_l2_values) / len(delta_l2_values)),
+        "step0_top_positive_persistence_jaccard": float(mean_persistence),
+        "half_life_step_l2_ratio_0_5": _first_step_below_ratio(delta_l2_values, ratio=0.5),
+    }
+
+
+@torch.no_grad()
+def _collect_logit_shift_trace(
+    module: Any,
+    *,
+    prompt_input_ids: torch.Tensor,
+    prompt_attention_mask: torch.Tensor,
+    reference_completion_token_ids: Sequence[int],
+    reference_name: str,
+    max_steps: int,
+    top_k: int,
+    include_special_tokens: bool,
+    feature_id: int,
+    steer_value: float,
+    intervention_scope: str,
+    intervention_steps: int,
+) -> Dict[str, Any]:
+    reference_ids = [int(x) for x in reference_completion_token_ids]
+    steps_to_analyze = max(0, min(int(max_steps), len(reference_ids)))
+    if steps_to_analyze <= 0:
+        return {
+            "reference": str(reference_name),
+            "configured_max_steps": int(max_steps),
+            "observed_steps": 0,
+            "top_k": int(top_k),
+            "include_special_tokens": bool(include_special_tokens),
+            "summary": _summarize_logit_shift_steps([]),
+            "steps": [],
+        }
+
+    tokens = prompt_input_ids.clone().to(module.device)
+    mask = prompt_attention_mask.clone().to(module.device)
+    prompt_len = int(tokens.shape[1])
+    steer_steps = max(0, int(intervention_steps))
+    special_token_ids: Optional[Set[int]] = None
+
+    step_records: List[Dict[str, Any]] = []
+    for step_idx in range(steps_to_analyze):
+        clean_full = _run_base_logits(module, input_ids=tokens, attention_mask=mask)
+        clean_next = clean_full[:, -1, :].detach().float().squeeze(0).cpu()
+
+        steered_applied = step_idx < steer_steps
+        if steered_applied:
+            steered_full = _run_steered_logits(
+                module,
+                input_ids=tokens,
+                attention_mask=mask,
+                feature_id=int(feature_id),
+                steer_value=float(steer_value),
+                scope=str(intervention_scope),
+                prompt_len=prompt_len,
+            )
+            steered_next = steered_full[:, -1, :].detach().float().squeeze(0).cpu()
+        else:
+            steered_next = clean_next.clone()
+
+        delta = steered_next - clean_next
+        clean_probs = torch.softmax(clean_next, dim=-1)
+        steered_probs = torch.softmax(steered_next, dim=-1)
+        mixture_probs = 0.5 * (clean_probs + steered_probs)
+
+        if special_token_ids is None:
+            special_token_ids = _build_special_token_id_set(module.tokenizer, vocab_size=int(delta.shape[0]))
+        pos_records, neg_records = _collect_top_delta_records(
+            module=module,
+            delta_logits=delta,
+            clean_logits=clean_next,
+            steered_logits=steered_next,
+            clean_probs=clean_probs,
+            steered_probs=steered_probs,
+            top_k=int(top_k),
+            special_token_ids=special_token_ids,
+            include_special_tokens=bool(include_special_tokens),
+        )
+
+        reference_token_id = int(reference_ids[step_idx])
+        clean_rank = _safe_token_rank_desc(clean_next, reference_token_id)
+        steered_rank = _safe_token_rank_desc(steered_next, reference_token_id)
+        clean_argmax = int(torch.argmax(clean_next).item())
+        steered_argmax = int(torch.argmax(steered_next).item())
+        kl_clean_to_steered = float(
+            torch.sum(clean_probs * (torch.log(clean_probs + EPS) - torch.log(steered_probs + EPS))).item()
+        )
+        kl_steered_to_clean = float(
+            torch.sum(steered_probs * (torch.log(steered_probs + EPS) - torch.log(clean_probs + EPS))).item()
+        )
+        js_divergence = float(
+            0.5
+            * (
+                torch.sum(clean_probs * (torch.log(clean_probs + EPS) - torch.log(mixture_probs + EPS)))
+                + torch.sum(steered_probs * (torch.log(steered_probs + EPS) - torch.log(mixture_probs + EPS)))
+            ).item()
+        )
+        step_records.append(
+            {
+                "step": int(step_idx),
+                "steering_applied": bool(steered_applied),
+                "reference_token_id": reference_token_id,
+                "reference_token": _safe_decode_token(module.tokenizer, reference_token_id),
+                "clean_argmax_token_id": clean_argmax,
+                "clean_argmax_token": _safe_decode_token(module.tokenizer, clean_argmax),
+                "steered_argmax_token_id": steered_argmax,
+                "steered_argmax_token": _safe_decode_token(module.tokenizer, steered_argmax),
+                "argmax_changed": bool(clean_argmax != steered_argmax),
+                "reference_clean_logit": float(clean_next[reference_token_id].item())
+                if 0 <= reference_token_id < clean_next.shape[0]
+                else None,
+                "reference_steered_logit": float(steered_next[reference_token_id].item())
+                if 0 <= reference_token_id < steered_next.shape[0]
+                else None,
+                "reference_delta_logit": float(delta[reference_token_id].item())
+                if 0 <= reference_token_id < delta.shape[0]
+                else None,
+                "reference_clean_prob": float(clean_probs[reference_token_id].item())
+                if 0 <= reference_token_id < clean_probs.shape[0]
+                else None,
+                "reference_steered_prob": float(steered_probs[reference_token_id].item())
+                if 0 <= reference_token_id < steered_probs.shape[0]
+                else None,
+                "reference_delta_prob": float((steered_probs[reference_token_id] - clean_probs[reference_token_id]).item())
+                if 0 <= reference_token_id < clean_probs.shape[0]
+                else None,
+                "reference_clean_rank": int(clean_rank),
+                "reference_steered_rank": int(steered_rank),
+                "reference_rank_lift": int(clean_rank - steered_rank),
+                "delta_l2": float(torch.linalg.vector_norm(delta, ord=2).item()),
+                "delta_linf": float(torch.max(torch.abs(delta)).item()),
+                "kl_clean_to_steered": max(0.0, kl_clean_to_steered),
+                "kl_steered_to_clean": max(0.0, kl_steered_to_clean),
+                "js_divergence": max(0.0, js_divergence),
+                "top_positive_delta_tokens": pos_records,
+                "top_negative_delta_tokens": neg_records,
+            }
+        )
+
+        forced_token = torch.tensor([[reference_token_id]], dtype=tokens.dtype, device=tokens.device)
+        tokens = torch.cat([tokens, forced_token], dim=1)
+        forced_mask = torch.ones_like(forced_token, dtype=mask.dtype, device=mask.device)
+        mask = torch.cat([mask, forced_mask], dim=1)
+
+    return {
+        "reference": str(reference_name),
+        "configured_max_steps": int(max_steps),
+        "observed_steps": len(step_records),
+        "top_k": int(top_k),
+        "include_special_tokens": bool(include_special_tokens),
+        "summary": _summarize_logit_shift_steps(step_records),
+        "steps": step_records,
     }
 
 
@@ -540,6 +890,11 @@ def run_neuronpedia_steer(
     )
 
     scales = _resolve_strength_scales(args.strength_scales)
+    enable_logit_analysis = not bool(args.disable_logit_analysis)
+    logit_analysis_max_steps = max(0, int(args.logit_analysis_max_steps))
+    logit_analysis_top_k = max(0, int(args.logit_analysis_top_k))
+    include_special_tokens = bool(args.logit_analysis_include_special_tokens)
+    logit_reference_mode = str(args.logit_analysis_reference)
     sample_results: List[Dict[str, Any]] = []
     for rank, activation in tqdm(enumerate(selected, start=1), desc="Selected samples"):
         trunc_info = _truncate_prompt_from_activation(
@@ -560,6 +915,7 @@ def run_neuronpedia_steer(
             intervention_scope=str(args.intervention_scope),
             intervention_steps=max(0, int(args.intervention_steps)),
         )
+        clean_completion_token_ids = clean_output.get("completion_token_ids", [])
 
         trace = module.get_activation_trace(prompt_text)
         per_token_activation = trace.get("per_token_activation", [])
@@ -589,11 +945,46 @@ def run_neuronpedia_steer(
                 intervention_scope=str(args.intervention_scope),
                 intervention_steps=max(0, int(args.intervention_steps)),
             )
+            steered_completion_token_ids = steered_output.get("completion_token_ids", [])
+
+            if enable_logit_analysis and logit_analysis_max_steps > 0 and logit_analysis_top_k > 0:
+                if logit_reference_mode == "steered":
+                    reference_name = "steered_completion"
+                    reference_ids = steered_completion_token_ids
+                else:
+                    reference_name = "clean_completion"
+                    reference_ids = clean_completion_token_ids
+
+                logit_analysis = _collect_logit_shift_trace(
+                    module,
+                    prompt_input_ids=input_ids,
+                    prompt_attention_mask=attention_mask,
+                    reference_completion_token_ids=reference_ids,
+                    reference_name=reference_name,
+                    max_steps=logit_analysis_max_steps,
+                    top_k=logit_analysis_top_k,
+                    include_special_tokens=include_special_tokens,
+                    feature_id=int(args.feature_id),
+                    steer_value=steer_value,
+                    intervention_scope=str(args.intervention_scope),
+                    intervention_steps=max(0, int(args.intervention_steps)),
+                )
+            else:
+                logit_analysis = {
+                    "reference": "disabled",
+                    "configured_max_steps": logit_analysis_max_steps,
+                    "observed_steps": 0,
+                    "top_k": logit_analysis_top_k,
+                    "include_special_tokens": include_special_tokens,
+                    "summary": _summarize_logit_shift_steps([]),
+                    "steps": [],
+                }
             interventions.append(
                 {
                     "scale": float(scale),
                     "steer_value": steer_value,
                     "steered_output": steered_output,
+                    "logit_analysis": logit_analysis,
                 }
             )
 
@@ -638,6 +1029,11 @@ def run_neuronpedia_steer(
             "selection_method": 2,
             "max_prefix_tokens": int(args.max_prefix_tokens),
             "strength_scales": scales,
+            "logit_analysis_enabled": enable_logit_analysis,
+            "logit_analysis_max_steps": logit_analysis_max_steps,
+            "logit_analysis_top_k": logit_analysis_top_k,
+            "logit_analysis_reference": logit_reference_mode,
+            "logit_analysis_include_special_tokens": include_special_tokens,
             "output_path": str(output_path),
         },
         "neuronpedia": {

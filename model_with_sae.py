@@ -4,6 +4,7 @@ import os
 import functools
 import time
 import re
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -16,6 +17,11 @@ from transformer_lens import HookedTransformer
 
 from sae_lens import SAE as SAELensSAE  # type: ignore
 from sae_lens import HookedSAETransformer  # type: ignore
+
+try:
+    from safetensors.torch import load_file as load_safetensors_file
+except Exception:
+    load_safetensors_file = None
 
 from transformer_lens.utils import test_prompt, tokenize_and_concatenate
 
@@ -98,6 +104,70 @@ def load_tokenizer(model_name: str):
         return None
 
 
+def _finalize_local_sae_dict(sae_data: Dict[str, Any], *, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if "W_enc" in sae_data and "encoder.weight" not in sae_data:
+        sae_data["encoder.weight"] = sae_data["W_enc"].transpose(0, 1).contiguous()
+    if "W_dec" in sae_data and "decoder.weight" not in sae_data:
+        sae_data["decoder.weight"] = sae_data["W_dec"]
+    if "b_enc" in sae_data and "encoder.bias" not in sae_data:
+        sae_data["encoder.bias"] = sae_data["b_enc"]
+    if "b_dec" in sae_data and "decoder.bias" not in sae_data:
+        sae_data["decoder.bias"] = sae_data["b_dec"]
+
+    if "encoder.weight" in sae_data and "W_enc" not in sae_data:
+        sae_data["W_enc"] = sae_data["encoder.weight"]
+    if "decoder.weight" in sae_data and "W_dec" not in sae_data:
+        sae_data["W_dec"] = sae_data["decoder.weight"]
+    if "encoder.bias" in sae_data and "b_enc" not in sae_data:
+        sae_data["b_enc"] = sae_data["encoder.bias"]
+    if "decoder.bias" in sae_data and "b_dec" not in sae_data:
+        sae_data["b_dec"] = sae_data["decoder.bias"]
+
+    if config is not None:
+        sae_data["__config__"] = config
+    return sae_data
+
+
+def _load_local_safetensors_sae_dir(sae_dir: str, device: str) -> Dict[str, Any]:
+    if load_safetensors_file is None:
+        raise RuntimeError(
+            "safetensors is required to load this SAE directory. "
+            "Please install it with: pip install safetensors"
+        )
+
+    config: Dict[str, Any] = {}
+    config_path = os.path.join(sae_dir, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+
+    index_path = os.path.join(sae_dir, "model.safetensors.index.json")
+    single_path = os.path.join(sae_dir, "model.safetensors")
+
+    sae_data: Dict[str, Any] = {}
+    if os.path.exists(index_path):
+        with open(index_path, "r", encoding="utf-8") as f:
+            index_data = json.load(f)
+        weight_map = index_data.get("weight_map", {})
+        shard_names = sorted(set(str(v) for v in weight_map.values()))
+        for shard_name in shard_names:
+            shard_path = os.path.join(sae_dir, shard_name)
+            shard_tensors = load_safetensors_file(shard_path, device=str(device))
+            for key, tensor in shard_tensors.items():
+                sae_data[key] = tensor.to(device=device, dtype=torch.float32)
+        return _finalize_local_sae_dict(sae_data, config=config)
+
+    if os.path.exists(single_path):
+        shard_tensors = load_safetensors_file(single_path, device=str(device))
+        for key, tensor in shard_tensors.items():
+            sae_data[key] = tensor.to(device=device, dtype=torch.float32)
+        return _finalize_local_sae_dict(sae_data, config=config)
+
+    raise FileNotFoundError(
+        f"No params.npz, model.safetensors, or model.safetensors.index.json found under {sae_dir}"
+    )
+
+
 def load_sae(sae_path: str, device: str) -> Dict[str, Any]:
     try:
         # Support SAELens URI scheme: "sae-lens://release=...;sae_id=..."
@@ -114,7 +184,6 @@ def load_sae(sae_path: str, device: str) -> Dict[str, Any]:
             if not release or not sae_id:
                 print("Warning: Invalid sae-lens URI. Expected keys: release and sae_id")
                 return {}
-            # Load SAE and move to correct device
             print(f"Loading SAE from {release}/{sae_id} to device {device}")
             loaded = SAELensSAE.from_pretrained(
                 release=release,
@@ -125,11 +194,12 @@ def load_sae(sae_path: str, device: str) -> Dict[str, Any]:
             print(f"SAE loaded on {device}")
             return {"__sae_lens_obj__": sae_obj, "__source__": "sae-lens", "release": release, "sae_id": sae_id}
 
-        # Local checkpoint path (.npz from gemma-scope, or torch checkpoint)
         if os.path.isdir(sae_path):
             npz_candidate = os.path.join(sae_path, "params.npz")
             if os.path.exists(npz_candidate):
                 sae_path = npz_candidate
+            else:
+                return _load_local_safetensors_sae_dir(sae_path, device)
 
         if os.path.exists(sae_path):
             if sae_path.endswith(".npz"):
@@ -138,19 +208,23 @@ def load_sae(sae_path: str, device: str) -> Dict[str, Any]:
                 for key in npz_data.files:
                     arr = npz_data[key]
                     sae_data[key] = torch.from_numpy(arr).to(device=device, dtype=torch.float32)
+                return _finalize_local_sae_dict(sae_data)
 
-                # Provide alias keys used by legacy code paths.
-                if "W_enc" in sae_data and "encoder.weight" not in sae_data:
-                    sae_data["encoder.weight"] = sae_data["W_enc"].transpose(0, 1).contiguous()
-                if "W_dec" in sae_data and "decoder.weight" not in sae_data:
-                    sae_data["decoder.weight"] = sae_data["W_dec"]
-                if "b_enc" in sae_data and "encoder.bias" not in sae_data:
-                    sae_data["encoder.bias"] = sae_data["b_enc"]
-                if "b_dec" in sae_data and "decoder.bias" not in sae_data:
-                    sae_data["decoder.bias"] = sae_data["b_dec"]
-                return sae_data
+            if sae_path.endswith(".safetensors"):
+                if load_safetensors_file is None:
+                    raise RuntimeError(
+                        "safetensors is required to load this SAE file. "
+                        "Please install it with: pip install safetensors"
+                    )
+                sae_data = {
+                    key: value.to(device=device, dtype=torch.float32)
+                    for key, value in load_safetensors_file(sae_path, device=str(device)).items()
+                }
+                return _finalize_local_sae_dict(sae_data)
 
             sae_data = torch.load(sae_path, map_location=device)
+            if isinstance(sae_data, dict):
+                return _finalize_local_sae_dict(sae_data)
             return sae_data
         print(f"Warning: SAE file not found at {sae_path}")
         return {}
@@ -760,11 +834,11 @@ class ModelWithSAEModule:
             raise RuntimeError("No SAE loaded.")
 
         if "__sae_lens_obj__" in self.sae:
-            # print('encoding with sae-lens')
             sae_obj = self.sae["__sae_lens_obj__"]
             return sae_obj.encode(residual)
-        
-        # print('encoding with local sae')
+
+        cfg = self.sae.get("__config__", {}) if isinstance(self.sae, dict) else {}
+
         w_enc = self.sae.get("W_enc")
         if w_enc is None:
             w_enc = self.sae.get("encoder.weight")
@@ -780,8 +854,15 @@ class ModelWithSAEModule:
         threshold = self.sae.get("threshold")
 
         residual_dtype = residual.dtype
+        hidden = residual
+        if bool(cfg.get("input_normalize", False)):
+            eps = float(cfg.get("input_normalize_eps", 1e-5))
+            hidden_mean = hidden.mean(dim=-1, keepdim=True)
+            hidden_std = hidden.std(dim=-1, keepdim=True, unbiased=False)
+            hidden = (hidden - hidden_mean) / (hidden_std + eps)
+
         w_enc = w_enc.to(device=residual.device, dtype=residual_dtype)
-        centered = residual
+        centered = hidden
         if b_dec is not None:
             centered = centered - b_dec.to(device=residual.device, dtype=residual_dtype)
 
@@ -800,7 +881,18 @@ class ModelWithSAEModule:
             pre = pre + b_enc.to(device=pre.device, dtype=pre.dtype)
         if threshold is not None:
             pre = pre - threshold.to(device=pre.device, dtype=pre.dtype)
-        return F.relu(pre)
+
+        act = F.relu(pre)
+        activation_name = str(cfg.get("activation", "")).lower()
+        if activation_name == "topk":
+            k = int(cfg.get("k", 0) or 0)
+            if 0 < k < act.shape[-1]:
+                topk_values, topk_indices = torch.topk(act, k=k, dim=-1)
+                sparse_act = torch.zeros_like(act)
+                sparse_act.scatter_(-1, topk_indices, topk_values)
+                act = sparse_act
+
+        return act
 
     def _decode_with_sae(self, features: torch.Tensor) -> torch.Tensor:
         if not self.sae:
@@ -832,7 +924,7 @@ class ModelWithSAEModule:
             recon = torch.matmul(features, w_dec.transpose(0, 1))
         else:
             raise RuntimeError(
-                f"Incompatible decoder shape {tuple(w_dec.shape)} for feature dim {features.shape[-1]}."
+                f"Incom {features.shape[-1]}."
             )
 
         if b_dec is not None:

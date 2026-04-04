@@ -74,6 +74,15 @@ def parse_args() -> argparse.Namespace:
         help="Optional run folder under output-root. Defaults to current timestamp.",
     )
     parser.add_argument("--llm-name", type=str, default=BATCH_DEFAULT_LLM_NAME)
+    parser.add_argument(
+        "--sae-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional explicit SAE checkpoint path (or sae-lens:// URI). "
+            "If provided, skip canonical-map based SAE path resolution and pass this value directly."
+        ),
+    )
     parser.add_argument("--sae-root", type=Path, default=Path(BATCH_DEFAULT_SAE_ROOT))
     parser.add_argument("--canonical-map-path", type=Path, default=DEFAULT_CANONICAL_MAP_PATH)
     parser.add_argument("--width", type=str, default=BATCH_DEFAULT_WIDTH)
@@ -213,7 +222,7 @@ def build_command(
     layer_id: int,
     feature_id: int,
     llm_name: str,
-    sae_path: Path,
+    sae_path: str,
     output_root: Path,
     scope: str,
     step: int,
@@ -263,16 +272,28 @@ def iter_jobs(args: argparse.Namespace, run_output_root: Path) -> Iterable[Tuple
     else:
         strength_scales = normalize_strength_scales(args.strength_scales)
 
+    explicit_sae_path = str(args.sae_path).strip() if args.sae_path is not None else ""
+    use_explicit_sae_path = bool(explicit_sae_path)
+    if use_explicit_sae_path and not explicit_sae_path.startswith("sae-lens://"):
+        explicit_path = Path(explicit_sae_path).expanduser()
+        if not explicit_path.exists():
+            raise FileNotFoundError(f"explicit --sae-path not found: {explicit_path}")
+        explicit_sae_path = str(explicit_path)
+
     average_l0_cache = {}
     for layer_id, feature_id in pairs:
-        if layer_id not in average_l0_cache:
-            average_l0_cache[layer_id] = resolve_average_l0(
-                layer_id=layer_id,
-                width=args.width,
-                canonical_map_path=args.canonical_map_path,
-            )
-        average_l0 = average_l0_cache[layer_id]
-        sae_path = build_local_sae_path(args.sae_root, layer_id, args.width, average_l0)
+        if use_explicit_sae_path:
+            average_l0 = "from_sae_path"
+            sae_path = explicit_sae_path
+        else:
+            if layer_id not in average_l0_cache:
+                average_l0_cache[layer_id] = resolve_average_l0(
+                    layer_id=layer_id,
+                    width=args.width,
+                    canonical_map_path=args.canonical_map_path,
+                )
+            average_l0 = average_l0_cache[layer_id]
+            sae_path = str(build_local_sae_path(args.sae_root, layer_id, args.width, average_l0))
 
         for step in steps:
             for scope in scopes:

@@ -9,6 +9,7 @@ ALL_INTERVENTION_SCOPES: Tuple[str, ...] = (
     "all_original_tokens",
     "last_original_token_only",
     "natural_support_mask",
+    "online_reactivation_gating",
 )
 
 

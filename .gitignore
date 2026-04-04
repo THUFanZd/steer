@@ -3,3 +3,9 @@ __pycache__/
 pairs.txt
 scales.txt
 steps.txt
+pairs_*.txt
+AGENTS.md
+.agents
+papers/
+tools/
+RESEARCH_BRIEF.md

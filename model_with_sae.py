@@ -573,6 +573,128 @@ class ModelWithSAEModule:
 
         return trace
 
+    def get_activation_trace_from_tensors(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
+        feature_index = self.feature_index
+
+        trace: Dict[str, Any] = {
+            "tokens": [],
+            "token_ids": [],
+            "per_token_activation": [],
+            "summary_activation": 0.0,
+            "summary_activation_mean": 0.0,
+            "summary_activation_sum": 0.0,
+            "max_token_index": 0,
+            "layer_index": self.layer,
+            "shapes": {},
+            "raw_stats": {},
+        }
+
+        if self.model is None:
+            return trace
+        if input_ids.ndim != 2:
+            raise ValueError("input_ids must be shape [batch, seq].")
+
+        input_ids = input_ids.to(self.device)
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=self.device)
+        else:
+            attention_mask = attention_mask.to(self.device)
+
+        with torch.no_grad():
+            if self.use_hooked_transformer:
+                hook_name = self.hook_name
+                _, cache = self.model.run_with_cache(
+                    input_ids,
+                    names_filter=[hook_name]
+                )
+                layer_activations = cache[hook_name]
+            else:
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                hidden_states = outputs.hidden_states
+                assert isinstance(hidden_states, (list, tuple))
+
+                if self.layer >= len(hidden_states):
+                    return trace
+
+                layer_activations = hidden_states[self.layer]
+
+            ids_cpu = input_ids[0].detach().cpu().tolist()
+            if self.tokenizer is not None:
+                try:
+                    tokens = self.tokenizer.convert_ids_to_tokens(ids_cpu)
+                except Exception:
+                    tokens = [str(x) for x in ids_cpu]
+            else:
+                tokens = [str(x) for x in ids_cpu]
+
+            trace["tokens"] = tokens
+            trace["token_ids"] = ids_cpu
+            trace["shapes"] = {
+                "layer_activations": list(layer_activations.shape),
+            }
+
+            per_token_act: Optional[torch.Tensor] = None
+            summary_activation: float = 0.0
+            summary_activation_mean: float = 0.0
+            summary_activation_sum: float = 0.0
+            max_token_index: int = 0
+
+            if self.sae:
+                try:
+                    sae_features = self._encode_with_sae(layer_activations)
+                    if sae_features is not None and sae_features.ndim == 3 and feature_index < sae_features.shape[-1]:
+                        per_token_act = sae_features[0, :, feature_index]
+                        summary_activation = float(per_token_act.max().item())
+                        summary_activation_mean = float(per_token_act.mean().item())
+                        summary_activation_sum = float(per_token_act.sum().item())
+                        max_token_index = int(per_token_act.argmax().item())
+                        trace["shapes"]["sae_features"] = list(sae_features.shape)
+                except Exception as e:
+                    if hasattr(self, "debug") and self.debug:
+                        print(f"Warning: SAE encoding failed in get_activation_trace_from_tensors: {e}")
+                    per_token_act = None
+
+            if per_token_act is None:
+                norms = layer_activations.norm(dim=-1)[0]
+                per_token_act = norms
+                summary_activation = float(norms.max().item())
+                summary_activation_mean = float(norms.mean().item())
+                summary_activation_sum = float(norms.sum().item())
+                max_token_index = int(norms.argmax().item())
+
+            per_token_list = [float(x) for x in per_token_act.detach().cpu().tolist()]
+            trace["per_token_activation"] = per_token_list
+            trace["summary_activation"] = float(round(summary_activation, 4))
+            trace["summary_activation_mean"] = float(round(summary_activation_mean, 4))
+            trace["summary_activation_sum"] = float(round(summary_activation_sum, 4))
+            trace["max_token_index"] = max_token_index
+
+            if per_token_list:
+                mean_val = sum(per_token_list) / len(per_token_list)
+                variance = sum((x - mean_val) ** 2 for x in per_token_list) / len(per_token_list)
+                std_val = variance ** 0.5
+
+                trace["raw_stats"] = {
+                    "min": float(min(per_token_list)),
+                    "max": float(max(per_token_list)),
+                    "mean": float(mean_val),
+                    "sum": float(sum(per_token_list)),
+                    "std": float(std_val),
+                    "count": len(per_token_list),
+                }
+
+        return trace
+
     def _get_transformer_blocks(self):
         if self.model is None:
             raise RuntimeError("Model not loaded.")

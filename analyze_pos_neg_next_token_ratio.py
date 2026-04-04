@@ -20,6 +20,7 @@ SCOPES = {
     "all_original_tokens",
     "last_original_token_only",
     "natural_support_mask",
+    "online_reactivation_gating",
 }
 SENTENCEPIECE_SPACE = chr(9601)  # '▁'
 

@@ -39,6 +39,7 @@ from function import DEFAULT_CANONICAL_MAP_PATH, build_default_sae_path
 SENTENCE_END_RE = re.compile(r"[.!?。！？]")
 EPS = 1e-8
 NSM_ACTIVATION_THRESHOLD = EPS
+ORG_ACTIVATION_THRESHOLD = EPS
 NEURONPEDIA_BASE_URL = "https://www.neuronpedia.org"
 
 
@@ -573,6 +574,30 @@ def _build_natural_support_metadata(
     }
 
 
+def _build_org_gate_decision(
+    *,
+    module: Any,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    threshold: float = ORG_ACTIVATION_THRESHOLD,
+) -> Dict[str, Any]:
+    trace = module.get_activation_trace_from_tensors(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+    )
+    per_token_activation = trace.get("per_token_activation", [])
+    last_token_activation = 0.0
+    if isinstance(per_token_activation, list) and per_token_activation:
+        last_token_activation = _to_float(per_token_activation[-1], default=0.0)
+    gate_open = bool(last_token_activation > float(threshold))
+    return {
+        "threshold": float(threshold),
+        "clean_last_token_activation": float(last_token_activation),
+        "gate_open": gate_open,
+        "trace": trace,
+    }
+
+
 @torch.no_grad()
 def _run_steered_logits(
     module: Any,
@@ -635,6 +660,8 @@ def _generate_text(
     prompt_len = int(tokens.shape[1])
     eos_id = getattr(module.tokenizer, "eos_token_id", None)
     steer_steps = max(0, int(intervention_steps))
+    applied_intervention_steps: List[int] = []
+    org_gate_events: List[Dict[str, Any]] = []
 
     for step_idx in range(int(max_new_tokens)):
         should_steer = (
@@ -642,7 +669,37 @@ def _generate_text(
             and steer_value is not None
             and step_idx < steer_steps
         )
-        if should_steer:
+        if should_steer and str(intervention_scope) == "online_reactivation_gating":
+            gate_decision = _build_org_gate_decision(
+                module=module,
+                input_ids=tokens,
+                attention_mask=mask,
+            )
+            steering_applied = bool(gate_decision["gate_open"])
+            org_gate_events.append(
+                {
+                    "step": int(step_idx),
+                    "clean_last_token_activation": float(gate_decision["clean_last_token_activation"]),
+                    "threshold": float(gate_decision["threshold"]),
+                    "gate_open": bool(gate_decision["gate_open"]),
+                    "steering_applied": bool(steering_applied),
+                }
+            )
+            if steering_applied:
+                logits = _run_steered_logits(
+                    module,
+                    input_ids=tokens,
+                    attention_mask=mask,
+                    feature_id=int(feature_id),
+                    steer_value=float(steer_value),
+                    scope="last_token_only",
+                    prompt_len=prompt_len,
+                    prompt_positions=None,
+                )
+                applied_intervention_steps.append(int(step_idx))
+            else:
+                logits = _run_base_logits(module, input_ids=tokens, attention_mask=mask)
+        elif should_steer:
             logits = _run_steered_logits(
                 module,
                 input_ids=tokens,
@@ -653,6 +710,7 @@ def _generate_text(
                 prompt_len=prompt_len,
                 prompt_positions=prompt_positions,
             )
+            applied_intervention_steps.append(int(step_idx))
         else:
             logits = _run_base_logits(module, input_ids=tokens, attention_mask=mask)
 
@@ -678,6 +736,9 @@ def _generate_text(
         "generated_token_count": int(completion_ids.numel()),
         "completion_token_ids": completion_id_list,
         "completion_tokens": completion_tokens,
+        "intervention_count": len(applied_intervention_steps),
+        "applied_intervention_steps": applied_intervention_steps,
+        "org_gate_events": org_gate_events,
     }
 
 
@@ -794,6 +855,7 @@ def _summarize_logit_shift_steps(step_records: Sequence[Dict[str, Any]]) -> Dict
     if not step_records:
         return {
             "observed_steps": 0,
+            "intervention_count": 0,
             "argmax_switch_rate": 0.0,
             "mean_js_divergence": 0.0,
             "max_js_divergence": 0.0,
@@ -810,6 +872,7 @@ def _summarize_logit_shift_steps(step_records: Sequence[Dict[str, Any]]) -> Dict
     rank_lifts = [float(step.get("reference_rank_lift", 0.0)) for step in step_records]
     reference_prob_deltas = [float(step.get("reference_delta_prob", 0.0)) for step in step_records]
     argmax_switches = [1.0 if bool(step.get("argmax_changed", False)) else 0.0 for step in step_records]
+    intervention_count = sum(1 for step in step_records if bool(step.get("steering_applied", False)))
 
     max_js = max(js_values) if js_values else 0.0
     max_js_step = js_values.index(max_js) if js_values else None
@@ -832,6 +895,7 @@ def _summarize_logit_shift_steps(step_records: Sequence[Dict[str, Any]]) -> Dict
 
     return {
         "observed_steps": len(step_records),
+        "intervention_count": int(intervention_count),
         "argmax_switch_rate": float(sum(argmax_switches) / len(argmax_switches)),
         "mean_js_divergence": float(sum(js_values) / len(js_values)),
         "max_js_divergence": float(max_js),
@@ -868,6 +932,7 @@ def _collect_logit_shift_trace(
             "reference": str(reference_name),
             "configured_max_steps": int(max_steps),
             "observed_steps": 0,
+            "intervention_count": 0,
             "top_k": int(top_k),
             "include_special_tokens": bool(include_special_tokens),
             "summary": _summarize_logit_shift_steps([]),
@@ -885,7 +950,20 @@ def _collect_logit_shift_trace(
         clean_full = _run_base_logits(module, input_ids=tokens, attention_mask=mask)
         clean_next = clean_full[:, -1, :].detach().float().squeeze(0).cpu()
 
-        steered_applied = step_idx < steer_steps
+        clean_last_token_activation: Optional[float] = None
+        org_gate_open: Optional[bool] = None
+        steering_active = step_idx < steer_steps
+        steered_applied = steering_active
+        if steering_active and str(intervention_scope) == "online_reactivation_gating":
+            gate_decision = _build_org_gate_decision(
+                module=module,
+                input_ids=tokens,
+                attention_mask=mask,
+            )
+            clean_last_token_activation = float(gate_decision["clean_last_token_activation"])
+            org_gate_open = bool(gate_decision["gate_open"])
+            steered_applied = bool(org_gate_open)
+
         if steered_applied:
             steered_full = _run_steered_logits(
                 module,
@@ -893,9 +971,9 @@ def _collect_logit_shift_trace(
                 attention_mask=mask,
                 feature_id=int(feature_id),
                 steer_value=float(steer_value),
-                scope=str(intervention_scope),
+                scope="last_token_only" if str(intervention_scope) == "online_reactivation_gating" else str(intervention_scope),
                 prompt_len=prompt_len,
-                prompt_positions=prompt_positions,
+                prompt_positions=None if str(intervention_scope) == "online_reactivation_gating" else prompt_positions,
             )
             steered_next = steered_full[:, -1, :].detach().float().squeeze(0).cpu()
         else:
@@ -942,6 +1020,10 @@ def _collect_logit_shift_trace(
             {
                 "step": int(step_idx),
                 "steering_applied": bool(steered_applied),
+                "steering_attempted": bool(steering_active),
+                "clean_last_token_activation": clean_last_token_activation,
+                "org_gate_open": org_gate_open,
+                "org_gate_threshold": float(ORG_ACTIVATION_THRESHOLD) if str(intervention_scope) == "online_reactivation_gating" else None,
                 "reference_token_id": reference_token_id,
                 "reference_token": _safe_decode_token(module.tokenizer, reference_token_id),
                 "clean_argmax_token_id": clean_argmax,
@@ -985,13 +1067,15 @@ def _collect_logit_shift_trace(
         forced_mask = torch.ones_like(forced_token, dtype=mask.dtype, device=mask.device)
         mask = torch.cat([mask, forced_mask], dim=1)
 
+    summary = _summarize_logit_shift_steps(step_records)
     return {
         "reference": str(reference_name),
         "configured_max_steps": int(max_steps),
         "observed_steps": len(step_records),
+        "intervention_count": int(summary.get("intervention_count", 0)),
         "top_k": int(top_k),
         "include_special_tokens": bool(include_special_tokens),
-        "summary": _summarize_logit_shift_steps(step_records),
+        "summary": summary,
         "steps": step_records,
     }
 
@@ -1178,6 +1262,7 @@ def run_neuronpedia_steer(
                     "reference": "disabled",
                     "configured_max_steps": logit_analysis_max_steps,
                     "observed_steps": 0,
+                    "intervention_count": 0,
                     "top_k": logit_analysis_top_k,
                     "include_special_tokens": include_special_tokens,
                     "summary": _summarize_logit_shift_steps([]),

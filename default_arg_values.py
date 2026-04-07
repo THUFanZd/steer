@@ -25,12 +25,12 @@ STEER_DEFAULT_INTERVENTION_SCOPE = "last_token_only"
 STEER_DEFAULT_INTERVENTION_STEPS = 1
 STEER_DEFAULT_TOP_K_EXAMPLES = 3
 STEER_DEFAULT_MAX_PREFIX_TOKENS = 100
-STEER_DEFAULT_STRENGTH_SCALES: Tuple[float, ...] = (0.0, 2.0 / 3.0, 1.5)
+STEER_DEFAULT_STRENGTH_SCALES: Tuple[float, ...] = (-1, -0.5, 0.5, 1) # 0, 0.5, 1.5, 2 times
 STEER_DEFAULT_TIMEOUT = 30
 STEER_DEFAULT_OUTPUT_ROOT = "outputs"
 STEER_DEFAULT_OUTPUT_FILENAME = "steer_from_neuronpedia.json"
-STEER_DEFAULT_LOGIT_ANALYSIS_MAX_STEPS = 3
-STEER_DEFAULT_LOGIT_ANALYSIS_TOP_K = 10
+STEER_DEFAULT_LOGIT_ANALYSIS_MAX_STEPS = 10
+STEER_DEFAULT_LOGIT_ANALYSIS_TOP_K = 30
 STEER_DEFAULT_LOGIT_ANALYSIS_REFERENCE = "clean"
 
 
@@ -39,10 +39,10 @@ BATCH_DEFAULT_STEPS: Tuple[int, ...] = (1, 5, 999)
 BATCH_DEFAULT_SCOPES: Tuple[str, ...] = (
     "all_tokens",
     "last_token_only",
-    "all_original_tokens",
-    "last_original_token_only",
+    "natural_support_mask",
+    "online_reactivation_gating",
 )
-BATCH_DEFAULT_STRENGTH_SCALES: Tuple[str, ...] = ("-1", "-3", "1", "-5", "3")
+BATCH_DEFAULT_STRENGTH_SCALES: Tuple[str, ...] = ("-1", "-0.5", "0.5", "1")  # maybe: -6, 4
 BATCH_DEFAULT_PYTHON_EXE = "python"
 BATCH_DEFAULT_SCRIPT_PATH = "steer_from_neuronpedia.py"
 BATCH_DEFAULT_OUTPUT_ROOT = "outputs"

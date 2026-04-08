@@ -8,7 +8,7 @@ import sys
 import types
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 from default_arg_values import (
     ALL_INTERVENTION_SCOPES,
@@ -91,6 +91,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", nargs="*", type=int, default=list(BATCH_DEFAULT_STEPS))
     parser.add_argument("--scopes", nargs="*", default=list(BATCH_DEFAULT_SCOPES))
     parser.add_argument("--strength-scales", nargs="*", default=list(BATCH_DEFAULT_STRENGTH_SCALES))
+    parser.add_argument(
+        "--track-logit-tokens",
+        nargs="*",
+        default=None,
+        help=(
+            "Tokens to track in logit analysis. Supports space-separated and/or comma-separated values. "
+            "These are forwarded to steer_from_neuronpedia.py --track-logit-tokens."
+        ),
+    )
+    parser.add_argument(
+        "--track-logit-tokens-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional UTF-8 token file to track in logit analysis. "
+            "Forwarded to steer_from_neuronpedia.py --track-logit-tokens-file."
+        ),
+    )
     parser.add_argument("--extra-args", nargs=argparse.REMAINDER, default=[])
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
@@ -177,6 +195,22 @@ def normalize_strength_scales(scales: Sequence[str]) -> List[str]:
     return normalized
 
 
+def normalize_track_tokens(tokens: Optional[Sequence[str]]) -> List[str]:
+    if not tokens:
+        return []
+    normalized: List[str] = []
+    for item in tokens:
+        text = str(item).strip()
+        if not text:
+            continue
+        for piece in text.split(","):
+            token = piece.strip()
+            if token:
+                normalized.append(token)
+    normalized = list(dict.fromkeys(normalized))
+    return normalized
+
+
 def normalize_steps(steps: Sequence[object]) -> List[int]:
     normalized: List[int] = []
     for item in steps:
@@ -229,6 +263,8 @@ def build_command(
     device: str,
     top_k_examples: int,
     strength_scales: Sequence[str],
+    track_logit_tokens: Sequence[str],
+    track_logit_tokens_file: Optional[Path],
     extra_args: Sequence[str],
 ) -> List[str]:
     cmd = [
@@ -255,6 +291,10 @@ def build_command(
         "--strength-scales",
         *[str(x) for x in strength_scales],
     ]
+    if track_logit_tokens:
+        cmd.extend(["--track-logit-tokens", *[str(x) for x in track_logit_tokens]])
+    if track_logit_tokens_file is not None:
+        cmd.extend(["--track-logit-tokens-file", str(track_logit_tokens_file)])
     if extra_args:
         cmd.extend(extra_args)
     return cmd
@@ -271,6 +311,10 @@ def iter_jobs(args: argparse.Namespace, run_output_root: Path) -> Iterable[Tuple
         strength_scales = normalize_strength_scales(parse_list_file(args.strength_scales_file))
     else:
         strength_scales = normalize_strength_scales(args.strength_scales)
+    track_logit_tokens = normalize_track_tokens(args.track_logit_tokens)
+    track_logit_tokens_file = args.track_logit_tokens_file
+    if track_logit_tokens_file is not None and not track_logit_tokens_file.exists():
+        raise FileNotFoundError(f"track-logit-tokens file not found: {track_logit_tokens_file}")
 
     explicit_sae_path = str(args.sae_path).strip() if args.sae_path is not None else ""
     use_explicit_sae_path = bool(explicit_sae_path)
@@ -315,6 +359,8 @@ def iter_jobs(args: argparse.Namespace, run_output_root: Path) -> Iterable[Tuple
                     device=args.device,
                     top_k_examples=args.top_k_examples,
                     strength_scales=strength_scales,
+                    track_logit_tokens=track_logit_tokens,
+                    track_logit_tokens_file=track_logit_tokens_file,
                     extra_args=args.extra_args,
                 )
 

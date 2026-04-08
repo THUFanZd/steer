@@ -41,13 +41,14 @@ EPS = 1e-8
 NSM_ACTIVATION_THRESHOLD = EPS
 ORG_ACTIVATION_THRESHOLD = EPS
 NEURONPEDIA_BASE_URL = "https://www.neuronpedia.org"
+TOKEN_PREFIX_MARKERS: Tuple[str, ...] = ("▁", "Ġ", "##")
 DELTA_LOGIT_QUANTILES: Tuple[Tuple[str, float], ...] = (
     ("p01", 0.01),
     ("p05", 0.05),
     ("p10", 0.10),
     ("p90", 0.90),
     ("p95", 0.95),
-    ("p100", 1.00),
+    ("p99", 0.99),
 )
 
 
@@ -130,6 +131,25 @@ def _parse_args() -> argparse.Namespace:
         "--logit-analysis-include-special-tokens",
         action="store_true",
         help="Include tokenizer special tokens in top-k logits-delta lists.",
+    )
+    parser.add_argument(
+        "--track-logit-tokens",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "Track specified tokens during logit analysis (supports space-separated and/or comma-separated tokens). "
+            "Matching removes common tokenizer prefixes such as ▁ / Ġ / ##."
+        ),
+    )
+    parser.add_argument(
+        "--track-logit-tokens-file",
+        type=str,
+        default=None,
+        help=(
+            "Optional UTF-8 text file for tracked tokens. One token per line is recommended; "
+            "comma-separated tokens per line are also supported."
+        ),
     )
     return parser.parse_args()
 
@@ -218,6 +238,176 @@ def _resolve_strength_scales(raw_scales: Optional[Sequence[str]]) -> List[float]
     if not parsed:
         raise ValueError("No valid strength scales provided.")
     return parsed
+
+
+def _dedupe_preserve_order(items: Sequence[str]) -> List[str]:
+    result: List[str] = []
+    seen: Set[str] = set()
+    for item in items:
+        text = str(item)
+        if text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def _parse_token_values(raw_values: Optional[Sequence[str]]) -> List[str]:
+    if not raw_values:
+        return []
+    parsed: List[str] = []
+    for item in raw_values:
+        text = str(item).strip()
+        if not text:
+            continue
+        for piece in text.split(","):
+            token = piece.strip()
+            if token:
+                parsed.append(token)
+    return parsed
+
+
+def _load_tokens_from_file(path: Path) -> List[str]:
+    if not path.exists():
+        raise FileNotFoundError(f"track-logit-tokens file not found: {path}")
+    tokens: List[str] = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        for piece in line.split(","):
+            token = piece.strip()
+            if token:
+                tokens.append(token)
+    return tokens
+
+
+def _normalize_token_for_match(token_text: str) -> str:
+    text = str(token_text).strip()
+    if not text:
+        return ""
+    normalized = text
+    while True:
+        changed = False
+        for marker in TOKEN_PREFIX_MARKERS:
+            if normalized.startswith(marker):
+                normalized = normalized[len(marker) :]
+                changed = True
+                break
+        if not changed:
+            break
+    if normalized:
+        return normalized
+    return text
+
+
+def _resolve_tracked_logit_tokens(
+    raw_tokens: Optional[Sequence[str]],
+    tokens_file: Optional[str],
+) -> List[str]:
+    tokens = _parse_token_values(raw_tokens)
+    if tokens_file:
+        file_tokens = _load_tokens_from_file(Path(tokens_file))
+        tokens.extend(file_tokens)
+    return _dedupe_preserve_order(tokens)
+
+
+def _safe_tokenizer_vocab(tokenizer: Any) -> Dict[str, int]:
+    if tokenizer is None:
+        return {}
+    if hasattr(tokenizer, "get_vocab"):
+        try:
+            vocab = tokenizer.get_vocab()
+            if isinstance(vocab, dict):
+                return {str(k): int(v) for k, v in vocab.items()}
+        except Exception:
+            pass
+    vocab_attr = getattr(tokenizer, "vocab", None)
+    if isinstance(vocab_attr, dict):
+        return {str(k): int(v) for k, v in vocab_attr.items()}
+    return {}
+
+
+def _resolve_tracked_token_specs(tokenizer: Any, requested_tokens: Sequence[str]) -> Dict[str, Any]:
+    requested = _dedupe_preserve_order([str(x).strip() for x in requested_tokens if str(x).strip()])
+    specs: Dict[str, Any] = {
+        "requested_tokens": requested,
+        "unmatched_requested_tokens": [],
+        "request_matches": [],
+        "tracked_entries": [],
+    }
+    if not requested or tokenizer is None:
+        specs["unmatched_requested_tokens"] = list(requested)
+        return specs
+
+    vocab = _safe_tokenizer_vocab(tokenizer)
+    if not vocab:
+        specs["unmatched_requested_tokens"] = list(requested)
+        return specs
+
+    raw_to_ids: Dict[str, List[int]] = {}
+    normalized_to_ids: Dict[str, List[int]] = {}
+    id_to_token: Dict[int, str] = {}
+    for token_text, token_id_raw in vocab.items():
+        try:
+            token_id = int(token_id_raw)
+        except (TypeError, ValueError):
+            continue
+        id_to_token[token_id] = str(token_text)
+        raw_to_ids.setdefault(str(token_text), []).append(token_id)
+        normalized = _normalize_token_for_match(str(token_text))
+        if normalized:
+            normalized_to_ids.setdefault(normalized, []).append(token_id)
+
+    token_id_to_entry: Dict[int, Dict[str, Any]] = {}
+    unmatched: List[str] = []
+    request_matches: List[Dict[str, Any]] = []
+    for request_token in requested:
+        normalized_request = _normalize_token_for_match(request_token)
+        exact_ids = sorted(set(raw_to_ids.get(request_token, [])))
+        normalized_ids = sorted(set(normalized_to_ids.get(normalized_request, []))) if normalized_request else []
+        if exact_ids:
+            matched_ids = exact_ids
+            match_mode = "exact"
+        elif normalized_ids:
+            matched_ids = normalized_ids
+            match_mode = "normalized_prefix_stripped"
+        else:
+            matched_ids = []
+            match_mode = "unmatched"
+
+        request_matches.append(
+            {
+                "requested_token": str(request_token),
+                "normalized_requested_token": str(normalized_request),
+                "match_mode": str(match_mode),
+                "matched_token_ids": [int(x) for x in matched_ids],
+            }
+        )
+        if not matched_ids:
+            unmatched.append(str(request_token))
+            continue
+
+        for token_id in matched_ids:
+            entry = token_id_to_entry.setdefault(
+                int(token_id),
+                {
+                    "token_id": int(token_id),
+                    "token": str(id_to_token.get(int(token_id), str(token_id))),
+                    "requested_tokens": [],
+                    "match_modes": [],
+                },
+            )
+            if request_token not in entry["requested_tokens"]:
+                entry["requested_tokens"].append(str(request_token))
+            if match_mode not in entry["match_modes"]:
+                entry["match_modes"].append(str(match_mode))
+
+    tracked_entries = [token_id_to_entry[k] for k in sorted(token_id_to_entry.keys())]
+    specs["unmatched_requested_tokens"] = unmatched
+    specs["request_matches"] = request_matches
+    specs["tracked_entries"] = tracked_entries
+    return specs
 
 
 def _safe_max_token(activation: Dict[str, Any]) -> str:
@@ -836,6 +1026,42 @@ def _collect_top_delta_records(
     return _build_records(pos_ids, pos_vals), _build_records(neg_ids, neg_vals)
 
 
+def _collect_tracked_token_delta_records(
+    *,
+    tracked_entries: Sequence[Dict[str, Any]],
+    delta_logits: torch.Tensor,
+    clean_logits: torch.Tensor,
+    steered_logits: torch.Tensor,
+    clean_probs: torch.Tensor,
+    steered_probs: torch.Tensor,
+) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    if delta_logits.ndim != 1:
+        raise ValueError("delta_logits must be 1-D.")
+    vocab_size = int(delta_logits.shape[0])
+    for entry in tracked_entries:
+        try:
+            token_id = int(entry.get("token_id"))
+        except Exception:
+            continue
+        if token_id < 0 or token_id >= vocab_size:
+            continue
+        records.append(
+            {
+                "token_id": int(token_id),
+                "token": str(entry.get("token", token_id)),
+                "requested_tokens": [str(x) for x in entry.get("requested_tokens", [])],
+                "match_modes": [str(x) for x in entry.get("match_modes", [])],
+                "delta_logit": float(delta_logits[token_id].item()),
+                "clean_logit": float(clean_logits[token_id].item()),
+                "steered_logit": float(steered_logits[token_id].item()),
+                "clean_prob": float(clean_probs[token_id].item()),
+                "steered_prob": float(steered_probs[token_id].item()),
+            }
+        )
+    return records
+
+
 def _jaccard_similarity(a: Set[int], b: Set[int]) -> float:
     if not a and not b:
         return 1.0
@@ -950,7 +1176,10 @@ def _collect_logit_shift_trace(
     intervention_scope: str,
     intervention_steps: int,
     prompt_positions: Optional[Sequence[int]] = None,
+    tracked_token_specs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    tracked_specs = tracked_token_specs or {}
+    tracked_entries = tracked_specs.get("tracked_entries", [])
     reference_ids = [int(x) for x in reference_completion_token_ids]
     steps_to_analyze = max(0, min(int(max_steps), len(reference_ids)))
     if steps_to_analyze <= 0:
@@ -961,6 +1190,12 @@ def _collect_logit_shift_trace(
             "intervention_count": 0,
             "top_k": int(top_k),
             "include_special_tokens": bool(include_special_tokens),
+            "tracked_tokens": {
+                "requested_tokens": [str(x) for x in tracked_specs.get("requested_tokens", [])],
+                "unmatched_requested_tokens": [str(x) for x in tracked_specs.get("unmatched_requested_tokens", [])],
+                "request_matches": list(tracked_specs.get("request_matches", [])),
+                "matched_entries": list(tracked_entries),
+            },
             "summary": _summarize_logit_shift_steps([]),
             "steps": [],
         }
@@ -1023,6 +1258,14 @@ def _collect_logit_shift_trace(
             special_token_ids=special_token_ids,
             include_special_tokens=bool(include_special_tokens),
         )
+        tracked_records = _collect_tracked_token_delta_records(
+            tracked_entries=tracked_entries,
+            delta_logits=delta,
+            clean_logits=clean_next,
+            steered_logits=steered_next,
+            clean_probs=clean_probs,
+            steered_probs=steered_probs,
+        )
 
         reference_token_id = int(reference_ids[step_idx])
         clean_rank = _safe_token_rank_desc(clean_next, reference_token_id)
@@ -1084,6 +1327,7 @@ def _collect_logit_shift_trace(
                 "kl_clean_to_steered": max(0.0, kl_clean_to_steered),
                 "kl_steered_to_clean": max(0.0, kl_steered_to_clean),
                 "js_divergence": max(0.0, js_divergence),
+                "tracked_token_deltas": tracked_records,
                 "top_positive_delta_tokens": pos_records,
                 "top_negative_delta_tokens": neg_records,
             }
@@ -1102,6 +1346,12 @@ def _collect_logit_shift_trace(
         "intervention_count": int(summary.get("intervention_count", 0)),
         "top_k": int(top_k),
         "include_special_tokens": bool(include_special_tokens),
+        "tracked_tokens": {
+            "requested_tokens": [str(x) for x in tracked_specs.get("requested_tokens", [])],
+            "unmatched_requested_tokens": [str(x) for x in tracked_specs.get("unmatched_requested_tokens", [])],
+            "request_matches": list(tracked_specs.get("request_matches", [])),
+            "matched_entries": list(tracked_entries),
+        },
         "summary": summary,
         "steps": step_records,
     }
@@ -1198,6 +1448,11 @@ def run_neuronpedia_steer(
     logit_analysis_top_k = max(0, int(args.logit_analysis_top_k))
     include_special_tokens = bool(args.logit_analysis_include_special_tokens)
     logit_reference_mode = str(args.logit_analysis_reference)
+    tracked_logit_tokens = _resolve_tracked_logit_tokens(
+        raw_tokens=getattr(args, "track_logit_tokens", None),
+        tokens_file=getattr(args, "track_logit_tokens_file", None),
+    )
+    tracked_token_specs = _resolve_tracked_token_specs(module.tokenizer, tracked_logit_tokens)
     sample_results: List[Dict[str, Any]] = []
     for rank, activation in tqdm(enumerate(selected, start=1), desc="Selected samples"):
         trunc_info = _truncate_prompt_from_activation(
@@ -1283,6 +1538,7 @@ def run_neuronpedia_steer(
                     intervention_scope=str(args.intervention_scope),
                     intervention_steps=max(0, int(args.intervention_steps)),
                     prompt_positions=prompt_positions,
+                    tracked_token_specs=tracked_token_specs,
                 )
             else:
                 logit_analysis = {
@@ -1292,6 +1548,14 @@ def run_neuronpedia_steer(
                     "intervention_count": 0,
                     "top_k": logit_analysis_top_k,
                     "include_special_tokens": include_special_tokens,
+                    "tracked_tokens": {
+                        "requested_tokens": [str(x) for x in tracked_token_specs.get("requested_tokens", [])],
+                        "unmatched_requested_tokens": [
+                            str(x) for x in tracked_token_specs.get("unmatched_requested_tokens", [])
+                        ],
+                        "request_matches": list(tracked_token_specs.get("request_matches", [])),
+                        "matched_entries": list(tracked_token_specs.get("tracked_entries", [])),
+                    },
                     "summary": _summarize_logit_shift_steps([]),
                     "steps": [],
                 }
@@ -1352,6 +1616,16 @@ def run_neuronpedia_steer(
             "logit_analysis_top_k": logit_analysis_top_k,
             "logit_analysis_reference": logit_reference_mode,
             "logit_analysis_include_special_tokens": include_special_tokens,
+            "track_logit_tokens_requested": [str(x) for x in tracked_token_specs.get("requested_tokens", [])],
+            "track_logit_tokens_file": (
+                str(getattr(args, "track_logit_tokens_file"))
+                if getattr(args, "track_logit_tokens_file", None)
+                else None
+            ),
+            "track_logit_tokens_unmatched": [
+                str(x) for x in tracked_token_specs.get("unmatched_requested_tokens", [])
+            ],
+            "track_logit_tokens_matched_count": int(len(tracked_token_specs.get("tracked_entries", []))),
             "output_path": str(output_path),
         },
         "neuronpedia": {

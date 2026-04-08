@@ -41,6 +41,14 @@ EPS = 1e-8
 NSM_ACTIVATION_THRESHOLD = EPS
 ORG_ACTIVATION_THRESHOLD = EPS
 NEURONPEDIA_BASE_URL = "https://www.neuronpedia.org"
+DELTA_LOGIT_QUANTILES: Tuple[Tuple[str, float], ...] = (
+    ("p01", 0.01),
+    ("p05", 0.05),
+    ("p10", 0.10),
+    ("p90", 0.90),
+    ("p95", 0.95),
+    ("p100", 1.00),
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -851,6 +859,24 @@ def _first_step_below_ratio(values: Sequence[float], ratio: float) -> Optional[i
     return None
 
 
+def _compute_delta_logit_quantiles(delta_logits: torch.Tensor) -> Dict[str, float]:
+    if delta_logits.ndim != 1:
+        raise ValueError("delta_logits must be 1-D.")
+    if int(delta_logits.numel()) <= 0:
+        return {name: 0.0 for name, _ in DELTA_LOGIT_QUANTILES}
+
+    quantile_points = torch.tensor(
+        [q for _, q in DELTA_LOGIT_QUANTILES],
+        dtype=delta_logits.dtype,
+        device=delta_logits.device,
+    )
+    quantile_values = torch.quantile(delta_logits, quantile_points)
+    result: Dict[str, float] = {}
+    for (name, _), value in zip(DELTA_LOGIT_QUANTILES, quantile_values.tolist()):
+        result[str(name)] = float(value)
+    return result
+
+
 def _summarize_logit_shift_steps(step_records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     if not step_records:
         return {
@@ -1054,6 +1080,7 @@ def _collect_logit_shift_trace(
                 "reference_rank_lift": int(clean_rank - steered_rank),
                 "delta_l2": float(torch.linalg.vector_norm(delta, ord=2).item()),
                 "delta_linf": float(torch.max(torch.abs(delta)).item()),
+                "delta_logit_quantiles": _compute_delta_logit_quantiles(delta),
                 "kl_clean_to_steered": max(0.0, kl_clean_to_steered),
                 "kl_steered_to_clean": max(0.0, kl_steered_to_clean),
                 "js_divergence": max(0.0, js_divergence),
